@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Extractor Extracto</title>
+  <style>
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      margin: 0;
+      padding: 16px;
+    }
+    h2 { font-size: 14px; margin: 0 0 8px 0; color: #10b981; }
+    p { font-size: 11px; color: #94a3b8; margin: 0 0 12px 0; }
+    label { font-size: 11px; font-weight: 600; color: #cbd5e1; display: block; margin-bottom: 4px; }
+    select, input {
+      width: 100%;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #fff;
+      padding: 6px 8px;
+      border-radius: 8px;
+      font-size: 12px;
+      box-sizing: border-box;
+      margin-bottom: 10px;
+    }
+    button {
+      width: 100%;
+      background: #10b981;
+      color: #022c22;
+      border: none;
+      padding: 10px;
+      border-radius: 8px;
+      font-weight: bold;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #059669; }
+    #status {
+      margin-top: 10px;
+      padding: 8px;
+      border-radius: 8px;
+      font-size: 11px;
+      display: none;
+    }
+    .status-ok { background: rgba(16, 185, 129, 0.2); border: 1px solid #10b981; color: #6ee7b7; }
+    .status-err { background: rgba(244, 63, 94, 0.2); border: 1px solid #f43f5e; color: #fda4af; }
+  </style>
+</head>
+<body>
+  <h2>🏦 Extractor de Extracto Bancario</h2>
+  <p>Vía A Asistida: Lee la tabla en pantalla sin bots de login.</p>
+
+  <label for="banco">Banco de la pestaña actual</label>
+  <select id="banco">
+    <option value="Itaú Unibanco">Itaú Empresas</option>
+    <option value="Bradesco">Bradesco Net Empresa</option>
+    <option value="Nubank">Nubank PJ</option>
+    <option value="Banco do Brasil">Banco do Brasil</option>
+    <option value="Inter">Banco Inter</option>
+    <option value="Generico">Tabla Genérica</option>
+  </select>
+
+  <label for="servidor">Servidor Local</label>
+  <input type="text" id="servidor" value="http://localhost:8000">
+
+  <button id="btn-capturar">🚀 Enviar Extracto en Pantalla</button>
+
+  <div id="status"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

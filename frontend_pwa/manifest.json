@@ -1,0 +1,33 @@
+{
+  "name": "Control Remesas Brasil ⇄ Bolivia",
+  "short_name": "Remesas B2B",
+  "description": "Sistema Semi-Automático de Control y Conciliación de Remesas",
+  "start_url": "/pwa/index.html",
+  "scope": "/pwa/",
+  "display": "standalone",
+  "background_color": "#0F172A",
+  "theme_color": "#10B981",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%2310B981'/><text x='50' y='65' font-size='50' text-anchor='middle' fill='white' font-weight='bold'>R</text></svg>",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml"
+    }
+  ],
+  "share_target": {
+    "action": "/pwa/index.html",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "files": [
+        {
+          "name": "voucher_share",
+          "accept": ["image/*", "application/pdf"]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  remesas-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: remesas-control
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GOOGLE_SHEETS_SPREADSHEET_ID=${GOOGLE_SHEETS_SPREADSHEET_ID}
+    volumes:
+      - ./storage:/app/storage
+      - ./backend/remesas.db:/app/backend/remesas.db
+    restart: unless-stopped

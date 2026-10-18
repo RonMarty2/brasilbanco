@@ -1,0 +1,33 @@
+# Entorno y dependencias
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+
+# Base de datos local
+backend/remesas.db
+backend/remesas.db-journal
+backend/remesas.db-wal
+backend/remesas.db-shm
+
+# Storage subido por usuarios (conservar estructura)
+storage/Historial/*
+!storage/Historial/.gitkeep
+!storage/Historial/*/.gitkeep
+
+# Credenciales de Google
+backend/credentials.json
+backend/token.json
+service_account.json
+
+# IDEs y SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

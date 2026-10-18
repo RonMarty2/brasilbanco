@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Control de Remesas | Brasil ⇄ Bolivia</title>
+  
+  <!-- PWA meta tags -->
+  <link rel="manifest" href="/pwa/manifest.json">
+  <meta name="theme-color" content="#0F172A">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Remesas B2B">
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#ECFDF5',
+              500: '#10B981',
+              600: '#059669',
+              700: '#047857'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Ocultar barra de scroll pero mantener funcionalidad de scroll horizontal */
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    body { -webkit-tap-highlight-color: transparent; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans antialiased min-h-screen pb-24 selection:bg-emerald-500 selection:text-white">
+
+  <!-- ========================================== -->
+  <!-- BARRA SUPERIOR HEADER -->
+  <!-- ========================================== -->
+  <header class="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-4 py-3 shadow-lg">
+    <div class="max-w-xl mx-auto flex items-center justify-between">
+      <div class="flex items-center space-x-2">
+        <div class="w-8 h-8 rounded-lg bg-emerald-500 flex items-center justify-center font-bold text-slate-950 text-lg shadow-emerald-500/30 shadow-md">
+          R
+        </div>
+        <div>
+          <h1 class="text-sm font-bold tracking-tight text-white flex items-center gap-1.5">
+            Remesas Brasil ⇄ Bolivia
+            <span class="text-[10px] bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-1.5 py-0.5 rounded font-mono font-medium">B2B</span>
+          </h1>
+          <p class="text-[11px] text-slate-400">Back-Office Semi-Automático (Human-in-the-Loop)</p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-2">
+        <span id="conn-status" class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-950 text-emerald-400 border border-emerald-800">
+          ● Online
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ========================================== -->
+  <!-- CONTENEDOR PRINCIPAL DE PESTAÑAS -->
+  <!-- ========================================== -->
+  <main class="max-w-xl mx-auto px-4 py-4">
+
+    <!-- ---------------------------------------- -->
+    <!-- PESTAÑA 1: ESCANEAR / PROCESAR VOUCHER -->
+    <!-- ---------------------------------------- -->
+    <section id="tab-escanear" class="tab-content space-y-4">
+      
+      <!-- Selector de Grupo de WhatsApp Obligatorio -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 shadow-sm">
+        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 flex items-center justify-between">
+          <span>1. Grupo de WhatsApp Origen <span class="text-emerald-400">*</span></span>
+          <span class="text-[10px] text-slate-400 font-normal">Toca para seleccionar</span>
+        </label>
+        <div id="grupos-container" class="flex gap-2 overflow-x-auto no-scrollbar pb-1">
+          <!-- Grupos cargados dinámicamente -->
+          <div class="animate-pulse flex space-x-2">
+            <div class="h-8 w-24 bg-slate-800 rounded-xl"></div>
+            <div class="h-8 w-28 bg-slate-800 rounded-xl"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Área de Carga / Cámara de Voucher -->
+      <div class="bg-slate-900 border-2 border-dashed border-slate-700 hover:border-emerald-500 rounded-2xl p-5 text-center transition-all cursor-pointer relative group" id="drop-zone">
+        <input type="file" id="voucher-file-input" accept="image/*,application/pdf" class="hidden">
+        
+        <div class="flex flex-col items-center justify-center space-y-2 pointer-events-none">
+          <div class="w-12 h-12 rounded-full bg-emerald-500/10 text-emerald-400 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">
+            📸
+          </div>
+          <div class="text-sm font-medium text-slate-200">
+            Toca aquí para sacar foto o subir comprobante
+          </div>
+          <p class="text-xs text-slate-400 max-w-xs">
+            Sube el voucher de WhatsApp (PIX, TED, Comprovante). Gemini Flash lo leerá automáticamente.
+          </p>
+        </div>
+      </div>
+
+      <!-- Loading Spinner de Análisis IA -->
+      <div id="ai-loading" class="hidden bg-slate-900/95 border border-emerald-500/40 rounded-2xl p-6 text-center shadow-xl backdrop-blur">
+        <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-emerald-500 border-t-transparent mb-3"></div>
+        <h3 class="text-sm font-semibold text-white">IA Gemini Flash analizando voucher...</h3>
+        <p class="text-xs text-slate-400 mt-1">Extrayendo monto, fecha, EndToEndId y cruzando con depósitos del extracto bancario.</p>
+      </div>
+
+      <!-- Tarjeta de Resultados Human-in-the-Loop -->
+      <div id="resultado-voucher" class="hidden space-y-4">
+
+        <!-- Banner Diagnóstico del Semáforo -->
+        <div id="diagnostico-banner" class="rounded-2xl p-4 border transition-all shadow-lg">
+          <!-- Inyectado dinámicamente: Verde / Amarillo / Rojo / Fraude -->
+        </div>
+
+        <!-- Opciones de Desempate (Sólo si hay colisión / empate amarillo) -->
+        <div id="candidatos-empate-container" class="hidden bg-slate-900 border border-amber-500/40 rounded-2xl p-4 space-y-2">
+          <h4 class="text-xs font-bold text-amber-400 uppercase tracking-wider flex items-center gap-1.5">
+            ⚠️ Elige el depósito correspondiente del extracto:
+          </h4>
+          <div id="candidatos-lista" class="space-y-2 mt-2">
+            <!-- Candidatos inyectados dinámicamente -->
+          </div>
+        </div>
+
+        <!-- Formulario Human-in-the-Loop (Todos los campos editables con el dedo) -->
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3.5 shadow-md">
+          <div class="flex items-center justify-between border-b border-slate-800 pb-2.5">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+              <span>✍️</span> Datos del Comprobante (Editables)
+            </h3>
+            <button type="button" id="btn-recalcular" class="text-[11px] bg-slate-800 hover:bg-slate-700 text-emerald-400 px-2 py-1 rounded-lg border border-slate-700 transition">
+              🔄 Re-verificar cruce
+            </button>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Monto (R$ BRL) *</label>
+              <input type="number" step="0.01" id="input-monto" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-base font-bold text-emerald-400 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Fecha Comprobante *</label>
+              <input type="date" id="input-fecha" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-sm text-white focus:outline-none">
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Hora Comprobante</label>
+              <input type="text" id="input-hora" placeholder="14:35" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-sm text-white focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Tipo de Operación</label>
+              <select id="input-tipo-op" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-sm text-white focus:outline-none">
+                <option value="PIX">PIX</option>
+                <option value="TED">TED</option>
+                <option value="TRANSFERENCIA">Transferencia</option>
+                <option value="DEPOSITO">Depósito</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">ID PIX (EndToEndId) / Autenticación</label>
+            <input type="text" id="input-id-pix" placeholder="E607011902026..." class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-xs font-mono text-slate-300 focus:outline-none">
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Pagador (Remitente)</label>
+              <input type="text" id="input-pagador" placeholder="Nombre de quien envía" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Receptor (Destino)</label>
+              <input type="text" id="input-receptor" placeholder="Titular cuenta en Brasil" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none">
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Banco Origen</label>
+              <input type="text" id="input-banco-orig" placeholder="Nubank, Itaú..." class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-[11px] font-medium text-slate-400 mb-1">Banco Destino</label>
+              <input type="text" id="input-banco-dest" placeholder="Itaú, Bradesco..." class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">Observaciones / Nota Back-Office</label>
+            <input type="text" id="input-observaciones" placeholder="Ej: Aprobado con llamada, cliente frecuente..." class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none">
+          </div>
+        </div>
+
+        <!-- Botones de Acción Inquebrantables -->
+        <div class="space-y-2 pt-1">
+          <!-- Botón de Confirmación Normal (Verde) -->
+          <button type="button" id="btn-confirmar-conciliacion" class="w-full py-3.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold rounded-2xl shadow-lg shadow-emerald-600/20 flex items-center justify-center space-x-2 transition transform active:scale-98">
+            <span class="text-lg">🟢</span>
+            <span class="text-sm font-extrabold uppercase">Confirmar y Marcar SÍ en Google Sheets</span>
+          </button>
+
+          <div class="grid grid-cols-2 gap-2">
+            <!-- Botón Dejar en Espera (Rojo) -->
+            <button type="button" id="btn-dejar-espera" class="py-3 px-3 bg-slate-800 hover:bg-slate-700 border border-rose-500/30 text-rose-400 font-semibold rounded-xl text-xs flex items-center justify-center space-x-1 transition">
+              <span>🔴</span>
+              <span>Dejar En Espera</span>
+            </button>
+
+            <!-- Botón de Emergencia Forzar SÍ -->
+            <button type="button" id="btn-forzar-si" class="py-3 px-3 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/40 text-amber-300 font-semibold rounded-xl text-xs flex items-center justify-center space-x-1 transition">
+              <span>🔓</span>
+              <span>Forzar SÍ Manual</span>
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+    <!-- ---------------------------------------- -->
+    <!-- PESTAÑA 2: EN ESPERA / PENDIENTES -->
+    <!-- ---------------------------------------- -->
+    <section id="tab-pendientes" class="tab-content hidden space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-base font-bold text-white">Vouchers en Espera</h2>
+          <p class="text-xs text-slate-400">Comprobantes pendientes de depósito en extracto</p>
+        </div>
+        <button id="btn-refresh-pendientes" class="p-2 bg-slate-900 border border-slate-800 text-slate-300 rounded-xl text-xs hover:bg-slate-800">
+          🔄 Actualizar
+        </button>
+      </div>
+
+      <div id="lista-pendientes" class="space-y-3">
+        <!-- Renderizado dinámico -->
+      </div>
+    </section>
+
+    <!-- ---------------------------------------- -->
+    <!-- PESTAÑA 3: EXTRACTOS / BOLSÓN DE DEPÓSITOS -->
+    <!-- ---------------------------------------- -->
+    <section id="tab-extractos" class="tab-content hidden space-y-4">
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow-md">
+        <h3 class="text-sm font-bold text-white flex items-center gap-1.5">
+          <span>🏦</span> Cargar Extracto Bancario
+        </h3>
+        <p class="text-xs text-slate-400">
+          <strong>Vía A:</strong> Usa la Extensión de Chrome en la PC.<br>
+          <strong>Vía B:</strong> Sube aquí captura o PDF del socio en Brasil, o archivo .OFX / .CSV.
+        </p>
+
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">Banco</label>
+            <select id="extracto-banco-select" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none">
+              <option value="Itaú Unibanco">Itaú Unibanco</option>
+              <option value="Bradesco">Bradesco</option>
+              <option value="Nubank">Nubank</option>
+              <option value="Banco do Brasil">Banco do Brasil</option>
+              <option value="Inter">Banco Inter</option>
+              <option value="Santander">Santander Brasil</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">Archivo Extracto</label>
+            <input type="file" id="extracto-file-input" accept="image/*,application/pdf,.csv,.ofx" class="w-full text-xs text-slate-400 file:mr-2 file:py-2 file:px-3 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-emerald-500/10 file:text-emerald-400 hover:file:bg-emerald-500/20">
+          </div>
+        </div>
+
+        <button type="button" id="btn-upload-extracto" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold rounded-xl text-xs transition">
+          📥 Extraer e Ingresar Depósitos a la Base Local
+        </button>
+      </div>
+
+      <!-- Bolsón de Depósitos Libres -->
+      <div class="space-y-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">
+            Depósitos Libres Disponibles (<span id="count-dep-libres">0</span>)
+          </h3>
+          <span class="text-[11px] text-emerald-400 font-mono" id="suma-dep-libres">R$ 0,00</span>
+        </div>
+        <div id="lista-depositos-libres" class="space-y-2">
+          <!-- Renderizado dinámico -->
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------- -->
+    <!-- PESTAÑA 4: HISTORIAL & GOOGLE SHEETS -->
+    <!-- ---------------------------------------- -->
+    <section id="tab-historial" class="tab-content hidden space-y-4">
+      
+      <!-- Métricas Resumen de Hoy -->
+      <div class="grid grid-cols-2 gap-3">
+        <div class="bg-slate-900 border border-emerald-500/30 rounded-2xl p-3.5 shadow-sm">
+          <p class="text-[11px] text-slate-400 font-medium">Conciliados Hoy (🟢 SÍ)</p>
+          <p class="text-xl font-extrabold text-emerald-400 mt-0.5" id="stat-monto-conciliado">R$ 0,00</p>
+          <p class="text-[10px] text-slate-400 mt-1"><span id="stat-count-conciliado">0</span> vouchers autorizados</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 shadow-sm">
+          <p class="text-[11px] text-slate-400 font-medium">En Espera (🔴)</p>
+          <p class="text-xl font-extrabold text-rose-400 mt-0.5" id="stat-monto-espera">R$ 0,00</p>
+          <p class="text-[10px] text-slate-400 mt-1"><span id="stat-count-espera">0</span> comprobantes pendientes</p>
+        </div>
+      </div>
+
+      <!-- Filtro y Lista Historial -->
+      <div class="space-y-2">
+        <div class="flex items-center justify-between">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">Últimos Movimientos Conciliados</h3>
+          <button id="btn-refresh-historial" class="text-[11px] text-emerald-400 hover:underline">Refrescar</button>
+        </div>
+        <div id="lista-historial" class="space-y-2.5">
+          <!-- Renderizado dinámico -->
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- ========================================== -->
+  <!-- BARRA DE NAVEGACIÓN INFERIOR (PWA MOBILE) -->
+  <!-- ========================================== -->
+  <nav class="fixed bottom-0 inset-x-0 z-40 bg-slate-900/95 backdrop-blur-lg border-t border-slate-800 px-2 py-2">
+    <div class="max-w-xl mx-auto grid grid-cols-4 gap-1">
+      
+      <button type="button" class="nav-tab active flex flex-col items-center py-1 text-emerald-400 transition" data-target="tab-escanear">
+        <span class="text-lg">📸</span>
+        <span class="text-[10px] font-medium mt-0.5">Escanear</span>
+      </button>
+
+      <button type="button" class="nav-tab flex flex-col items-center py-1 text-slate-400 hover:text-slate-200 transition" data-target="tab-pendientes">
+        <span class="text-lg relative">
+          ⏳
+          <span id="badge-pendientes-count" class="hidden absolute -top-1 -right-2 bg-rose-500 text-white text-[9px] font-bold rounded-full h-4 w-4 flex items-center justify-center">0</span>
+        </span>
+        <span class="text-[10px] font-medium mt-0.5">En Espera</span>
+      </button>
+
+      <button type="button" class="nav-tab flex flex-col items-center py-1 text-slate-400 hover:text-slate-200 transition" data-target="tab-extractos">
+        <span class="text-lg">🏦</span>
+        <span class="text-[10px] font-medium mt-0.5">Extractos</span>
+      </button>
+
+      <button type="button" class="nav-tab flex flex-col items-center py-1 text-slate-400 hover:text-slate-200 transition" data-target="tab-historial">
+        <span class="text-lg">📊</span>
+        <span class="text-[10px] font-medium mt-0.5">Historial</span>
+      </button>
+
+    </div>
+  </nav>
+
+  <!-- Contenedor de Notificaciones Toast -->
+  <div id="toast-container" class="fixed top-16 right-4 left-4 z-50 flex flex-col items-center pointer-events-none space-y-2"></div>
+
+  <!-- Script Principal de la App -->
+  <script src="/pwa/app.js"></script>
+</body>
+</html>

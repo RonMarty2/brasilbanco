@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Extractor de Extractos Bancarios | Remesas",
+  "version": "1.0.0",
+  "description": "Lee movimientos de pestañas bancarias abiertas (Itaú, Bradesco, etc.) y los envía al servidor de remesas.",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
