@@ -31,3 +31,14 @@ service_account.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Delegacion a agy
+delegar/_TRABAJO_AGY/
+delegar/METRICAS.csv
+
+# Capturas de actividad (datos sensibles)
+capturador/sesiones/
+capturador/dist/
+capturador/build/
+capturador/*.spec
+*.zip

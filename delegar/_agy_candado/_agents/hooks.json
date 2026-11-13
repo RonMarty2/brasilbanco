@@ -1,0 +1,16 @@
+{
+  "candado-agy": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -X utf8 candado_agy.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

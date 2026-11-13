@@ -1,0 +1,26 @@
+CAPTURADOR DE ACTIVIDAD
+=======================
+Graba lo que haces en la PC (y en el celular si lo conectas) para poder automatizar tu trabajo.
+
+ANTES DE EMPEZAR
+1. Copia esta carpeta completa a la PC (Escritorio esta bien). No necesita instalar nada.
+2. (SOLO si vas a usar el celular Android)
+   - En el celular: Ajustes > Acerca del telefono > toca 7 veces "Numero de compilacion".
+   - Ajustes > Opciones de desarrollador > activa "Depuracion USB".
+   - Conecta el celular por cable USB a la PC y ACEPTA el aviso "Permitir depuracion USB" (marca "Siempre").
+   - Deja el celular con la pantalla encendida mientras trabajas.
+
+PARA GRABAR
+1. Doble clic en  CAPTURAR.bat   (si Windows avisa, "Mas informacion" > "Ejecutar de todos modos").
+   Si pide permiso para el microfono, di que SI.
+2. Trabaja normal. Si puedes, ve diciendo en voz alta lo que haces y por que
+   ("ahora copio el monto del comprobante", "busco este deposito en el banco"). Es lo mas valioso.
+3. F9  = PAUSA / REANUDAR. Usala cada vez que escribas una contrasena o un codigo de seguridad.
+4. F10 = TERMINAR. Espera unos segundos: se genera el informe y se abre la carpeta "sesiones".
+
+AL TERMINAR
+Envia el archivo  sesiones\<fecha>.zip  (WhatsApp de escritorio, Drive o pendrive).
+NO lo subas a GitHub ni lo compartas con nadie mas: contiene datos de clientes.
+
+QUE REGISTRA: pantalla, clics, lo que escribes (menos en ventanas de contrasena), lo que copias,
+archivos que descargas, tu voz, y el celular si esta conectado. Todo queda SOLO en esta PC hasta que lo envies.

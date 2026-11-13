@@ -1,0 +1,10 @@
+{
+  "_que_es": "Configuracion de brasilbanco para el motor unico de agy (_AGENTES_CENTRAL\\motor_agy, 02-11-2026). Rutas relativas a esta carpeta (delegar).",
+  "nombre": "brasilbanco",
+  "vigilar": [".."],
+  "ignorar_dirs": ["node_modules", "_TRABAJO_AGY", "venv", "sesiones", "Historial", "__pycache__", "herramientas", "frames"],
+  "texto_ext": [".md", ".py", ".txt", ".csv", ".json", ".jsonl", ".html", ".js", ".bat"],
+  "copiar_ignorar": ["__pycache__", "*.tmp", "_VIEJO", "*.mp3", "*.mp4", "*.wav", "*.m4a", "*.webm", "*.zip", "*.exe", "*.db", "venv", "sesiones", "herramientas"],
+  "regla_trato": "Espanol neutro, trato de tu.",
+  "marcadores": {"{proyecto}": ".."}
+}
