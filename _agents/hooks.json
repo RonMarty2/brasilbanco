@@ -10,7 +10,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "\"C:/Program Files/Python311/python.exe\" \"C:/Users/lmigu/SynologyDrive/12.NUBES/_AGENTES_CENTRAL/herramientas/agy_puente.py\" --evento PreInvocation \"sugerir_agente.py\" \"decisiones.py\" \"ancla_hook.py\" \"autoaviso_desperdicio.py\"",
+        "command": "\"C:/Program Files/Python311/python.exe\" \"C:/Users/lmigu/SynologyDrive/12.NUBES/_AGENTES_CENTRAL/herramientas/agy_puente.py\" --evento PreInvocation \"sugerir_agente.py\" \"recomendar_modelo.py\" \"decisiones.py\" \"ancla_hook.py\" \"autoaviso_desperdicio.py\"",
         "timeout": 25
       }
     ],
