@@ -85,9 +85,10 @@ def sincronizar_voucher_sheets(voucher: Dict[str, Any], estado_display: str = "�
                 "Banco Destino", "ID PIX / Transacción", "Fecha Registro Back-Office", "Observaciones"
             ])
 
-        # Fila a agregar o actualizar
+        # Fila a agregar o actualizar (evitar duplicados por #ID)
+        voucher_tag = f"#{voucher.get('id')}"
         fila = [
-            f"#{voucher.get('id')}",
+            voucher_tag,
             estado_display,
             float(voucher.get("monto", 0.0)),
             voucher.get("fecha_comprobante"),
@@ -101,12 +102,23 @@ def sincronizar_voucher_sheets(voucher: Dict[str, Any], estado_display: str = "�
             voucher.get("observaciones", "")
         ]
 
-        worksheet.append_row(fila)
+        celda_existente = None
+        try:
+            celda_existente = worksheet.find(voucher_tag, in_column=1)
+        except Exception:
+            celda_existente = None
+
+        if celda_existente:
+            worksheet.update(f"A{celda_existente.row}:L{celda_existente.row}", [fila])
+            accion_msg = "actualizado"
+        else:
+            worksheet.append_row(fila)
+            accion_msg = "registrado"
 
         return {
             "success": True,
             "simulado": False,
-            "mensaje": f"Sincronizado en pestaña '{nombre_pestana}' de Google Sheets"
+            "mensaje": f"Voucher {accion_msg} en pestaña '{nombre_pestana}' de Google Sheets"
         }
 
     except Exception as e:
@@ -117,4 +129,76 @@ def sincronizar_voucher_sheets(voucher: Dict[str, Any], estado_display: str = "�
             "simulado": True,
             "error": error_msg,
             "mensaje": "Voucher guardado en base local. Se intentará resincronizar cuando Google Sheets esté disponible."
+        }
+
+
+def sincronizar_cierre_sheets(cierre_resumen: Dict[str, Any]) -> Dict[str, Any]:
+    """Registra o actualiza una fila de cierre diario en la pestaña CIERRES_CAJA de Google Sheets."""
+    spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", SPREADSHEET_ID)
+    fecha = cierre_resumen.get("fecha", datetime.now().strftime("%Y-%m-%d"))
+    tot = cierre_resumen.get("totales", {})
+    cierre = cierre_resumen.get("cierre_guardado") or {}
+
+    client = _obtener_cliente_sheets()
+    if not client or not spreadsheet_id:
+        print(f"[INFO-SHEETS SIMULADO] Cierre de caja {fecha} guardado localmente (Total aprobado: R$ {tot.get('aprobado_monto', 0):.2f})")
+        return {
+            "success": True,
+            "simulado": True,
+            "mensaje": "Cierre guardado localmente (Google Sheets en modo tolerancia a fallos)"
+        }
+
+    try:
+        doc = client.open_by_key(spreadsheet_id)
+        nombre_pestana = "CIERRES_CAJA"
+        try:
+            worksheet = doc.worksheet(nombre_pestana)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = doc.add_worksheet(title=nombre_pestana, rows="200", cols="14")
+            worksheet.append_row([
+                "Fecha", "Estado", "Conciliados (R$)", "Forzados (R$)", "Total Aprobado (R$)",
+                "En Espera (R$)", "Entradas Extracto (R$)", "Depósitos Libres (R$)",
+                "Saldo Inicial (R$)", "Salidas (R$)", "Saldo Teórico (R$)",
+                "Saldo Real (R$)", "Diferencia (R$)", "Observaciones"
+            ])
+
+        fila = [
+            fecha,
+            cierre.get("estado", "CERRADO"),
+            tot.get("conciliados_monto", 0.0),
+            tot.get("forzados_monto", 0.0),
+            tot.get("aprobado_monto", 0.0),
+            tot.get("espera_monto", 0.0),
+            tot.get("depositos_dia_monto", 0.0),
+            tot.get("depositos_libres_monto", 0.0),
+            cierre.get("saldo_inicial_brl", 0.0),
+            cierre.get("salidas_brl", 0.0),
+            cierre.get("saldo_final_teorico_brl", 0.0),
+            cierre.get("saldo_final_real_brl") if cierre.get("saldo_final_real_brl") is not None else "",
+            cierre.get("diferencia_brl", 0.0),
+            cierre.get("observaciones", ""),
+        ]
+
+        celda_existente = None
+        try:
+            celda_existente = worksheet.find(fecha, in_column=1)
+        except Exception:
+            celda_existente = None
+
+        if celda_existente:
+            worksheet.update(f"A{celda_existente.row}:N{celda_existente.row}", [fila])
+        else:
+            worksheet.append_row(fila)
+
+        return {
+            "success": True,
+            "simulado": False,
+            "mensaje": f"Cierre {fecha} sincronizado en pestaña '{nombre_pestana}'"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "simulado": True,
+            "error": str(e),
+            "mensaje": "Cierre guardado localmente; error al sincronizar con Google Sheets."
         }

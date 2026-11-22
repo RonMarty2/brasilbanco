@@ -79,6 +79,7 @@ def extraer_datos_voucher(archivo_bytes: bytes, mime_type: str = "image/jpeg") -
     """
 
     api_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+    allow_mock = os.getenv("ALLOW_AI_MOCK", "false").lower() in ("1", "true", "yes")
     
     if api_key and (HAS_GOOGLE_GENAI or HAS_GOOGLE_GENERATIVEAI):
         try:
@@ -104,12 +105,18 @@ def extraer_datos_voucher(archivo_bytes: bytes, mime_type: str = "image/jpeg") -
             data = json.loads(json_str)
             # Asegurar tipos
             data["monto"] = float(data.get("monto", 0.0) or 0.0)
+            data["_es_mock"] = False
             return data
         except Exception as e:
-            print(f"[WARN] Error al invocar Gemini API: {e}. Usando extractor de rescate heurístico.")
+            print(f"[ERROR] Error al invocar Gemini API en voucher: {e}")
+            if not allow_mock:
+                raise RuntimeError(f"Error al leer el comprobante con Gemini AI: {e}")
     
-    # Fallback / Modo de rescate heurístico (útil para pruebas locales o si no hay API key aún)
-    return _heuristica_voucher_mock(archivo_bytes)
+    # Modo demo explícito cuando no hay API key (o ALLOW_AI_MOCK=true)
+    mock_data = _heuristica_voucher_mock(archivo_bytes)
+    mock_data["_es_mock"] = True
+    mock_data["_aviso"] = "MODO DEMO (sin GEMINI_API_KEY): datos de ejemplo, edita el monto y fecha antes de confirmar."
+    return mock_data
 
 
 def extraer_datos_extracto(archivo_bytes: bytes, mime_type: str = "image/jpeg", nombre_banco: str = "Banco Brasil") -> List[Dict[str, Any]]:
@@ -146,6 +153,7 @@ def extraer_datos_extracto(archivo_bytes: bytes, mime_type: str = "image/jpeg", 
     """
 
     api_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+    allow_mock = os.getenv("ALLOW_AI_MOCK", "false").lower() in ("1", "true", "yes")
     
     if api_key and (HAS_GOOGLE_GENAI or HAS_GOOGLE_GENERATIVEAI):
         try:
@@ -173,9 +181,11 @@ def extraer_datos_extracto(archivo_bytes: bytes, mime_type: str = "image/jpeg", 
                 d["origen_extracto"] = "IA_IMAGEN"
             return depositos
         except Exception as e:
-            print(f"[WARN] Error procesando extracto con Gemini: {e}")
+            print(f"[ERROR] Error procesando extracto con Gemini: {e}")
+            if not allow_mock:
+                raise RuntimeError(f"Error al leer el extracto con Gemini AI: {e}")
 
-    # Fallback heurístico
+    # Fallback explícito solo en modo demo sin API key
     return _heuristica_extracto_mock(nombre_banco)
 
 

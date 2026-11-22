@@ -94,11 +94,34 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         voucher_id INTEGER NOT NULL,
         deposito_id INTEGER,
-        accion TEXT NOT NULL,               -- 'MATCH_AUTOMATICO', 'DESEMPATE_MANUAL', 'FORZADO_MANUAL', 'EN_ESPERA', 'DUPLICADO_DETECTADO'
+        accion TEXT NOT NULL,               -- 'MATCH_AUTOMATICO', 'DESEMPATE_MANUAL', 'FORZADO_MANUAL', 'EN_ESPERA', 'DUPLICADO_DETECTADO', 'ANULADO', 'AUTO_RECRUCE'
         detalles TEXT,
         usuario TEXT DEFAULT 'Back-office',
         fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (voucher_id) REFERENCES vouchers (id)
+    );
+    """)
+
+    # 5. Tabla de Cierres de Caja Nocturnos
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cierres_caja (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fecha TEXT NOT NULL UNIQUE,         -- YYYY-MM-DD
+        estado TEXT DEFAULT 'CERRADO',      -- 'ABIERTO', 'CERRADO'
+        saldo_inicial_brl REAL DEFAULT 0,
+        salidas_brl REAL DEFAULT 0,
+        saldo_final_teorico_brl REAL DEFAULT 0,
+        saldo_final_real_brl REAL,
+        diferencia_brl REAL DEFAULT 0,
+        total_conciliado_brl REAL DEFAULT 0,
+        total_forzado_brl REAL DEFAULT 0,
+        total_espera_brl REAL DEFAULT 0,
+        total_depositos_dia_brl REAL DEFAULT 0,
+        total_libres_brl REAL DEFAULT 0,
+        observaciones TEXT,
+        resumen_json TEXT,
+        resumen_whatsapp TEXT,
+        cerrado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
 
@@ -373,6 +396,326 @@ def get_estadisticas_hoy(fecha_hoy: str) -> Dict[str, Any]:
         "libres_total_count": row_dep_total[0],
         "libres_total_monto": round(row_dep_total[1], 2),
     }
+
+def anular_voucher(voucher_id: int, motivo: str = "") -> Dict[str, Any]:
+    """Anula un voucher y libera su depósito asociado (si tenía uno) para corregir errores."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM vouchers WHERE id = ?;", (voucher_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return {"success": False, "error": f"Voucher #{voucher_id} no encontrado"}
+
+    voucher = dict(row)
+    dep_id = voucher.get("deposito_asociado_id")
+    obs_anterior = voucher.get("observaciones") or ""
+    nueva_obs = f"{obs_anterior} [ANULADO: {motivo or 'Corrección manual'}]".strip()
+
+    cursor.execute("""
+        UPDATE vouchers
+        SET estado = 'ANULADO',
+            deposito_asociado_id = NULL,
+            observaciones = ?
+        WHERE id = ?;
+    """, (nueva_obs, voucher_id))
+
+    deposito_liberado = False
+    if dep_id:
+        cursor.execute("""
+            UPDATE depositos_extracto
+            SET estado = 'LIBRE',
+                voucher_id = NULL
+            WHERE id = ?;
+        """, (dep_id,))
+        deposito_liberado = True
+
+    cursor.execute("""
+        INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles)
+        VALUES (?, ?, 'ANULADO', ?);
+    """, (voucher_id, dep_id, motivo or "Anulado manualmente"))
+
+    conn.commit()
+    conn.close()
+    return {
+        "success": True,
+        "voucher_id": voucher_id,
+        "deposito_liberado": deposito_liberado,
+        "deposito_id": dep_id,
+        "voucher": {**voucher, "estado": "ANULADO", "observaciones": nueva_obs}
+    }
+
+
+def get_resumen_cierre_dia(fecha: str) -> Dict[str, Any]:
+    """Calcula el cuadre completo de cierre de caja para una fecha YYYY-MM-DD."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Vouchers del día (por fecha_comprobante o fecha_conciliacion), excluyendo ANULADO
+    cursor.execute("""
+        SELECT * FROM vouchers
+        WHERE estado != 'ANULADO'
+        AND (fecha_comprobante = ? OR date(fecha_conciliacion) = ?)
+        ORDER BY id DESC;
+    """, (fecha, fecha))
+    vouchers_dia = rows_to_list(cursor.fetchall())
+
+    # Todos los vouchers EN_ESPERA activos (incluyendo de días anteriores)
+    cursor.execute("""
+        SELECT * FROM vouchers
+        WHERE estado = 'EN_ESPERA'
+        ORDER BY fecha_comprobante DESC, id DESC;
+    """)
+    vouchers_espera = rows_to_list(cursor.fetchall())
+
+    # Depósitos del extracto de esa fecha
+    cursor.execute("""
+        SELECT * FROM depositos_extracto
+        WHERE fecha = ? AND estado != 'ANULADO'
+        ORDER BY banco ASC, hora DESC, id DESC;
+    """, (fecha,))
+    depositos_dia = rows_to_list(cursor.fetchall())
+
+    # Cierre ya guardado (si existe)
+    cursor.execute("SELECT * FROM cierres_caja WHERE fecha = ?;", (fecha,))
+    cierre_row = cursor.fetchone()
+    cierre_guardado = row_to_dict(cierre_row) if cierre_row else None
+
+    conn.close()
+
+    conciliados = [v for v in vouchers_dia if v["estado"] == "CONCILIADO"]
+    forzados = [v for v in vouchers_dia if v["estado"] == "FORZADO_MANUAL"]
+    depositos_usados = [d for d in depositos_dia if d["estado"] == "USADO"]
+    depositos_libres = [d for d in depositos_dia if d["estado"] == "LIBRE"]
+
+    total_conciliado = round(sum(v["monto"] for v in conciliados), 2)
+    total_forzado = round(sum(v["monto"] for v in forzados), 2)
+    total_aprobado = round(total_conciliado + total_forzado, 2)
+    total_espera = round(sum(v["monto"] for v in vouchers_espera), 2)
+    total_depositos_dia = round(sum(d["monto"] for d in depositos_dia), 2)
+    total_usados_dia = round(sum(d["monto"] for d in depositos_usados), 2)
+    total_libres_dia = round(sum(d["monto"] for d in depositos_libres), 2)
+
+    # Desglose por Grupo de WhatsApp
+    grupos_map: Dict[str, Dict[str, Any]] = {}
+    for v in vouchers_dia:
+        nombre = v.get("grupo_whatsapp_nombre") or "General"
+        if nombre not in grupos_map:
+            grupos_map[nombre] = {
+                "grupo": nombre,
+                "conciliados_count": 0,
+                "conciliados_monto": 0.0,
+                "forzados_count": 0,
+                "forzados_monto": 0.0,
+                "espera_count": 0,
+                "espera_monto": 0.0,
+                "total_aprobado_count": 0,
+                "total_aprobado_monto": 0.0,
+            }
+        g = grupos_map[nombre]
+        if v["estado"] == "CONCILIADO":
+            g["conciliados_count"] += 1
+            g["conciliados_monto"] = round(g["conciliados_monto"] + v["monto"], 2)
+            g["total_aprobado_count"] += 1
+            g["total_aprobado_monto"] = round(g["total_aprobado_monto"] + v["monto"], 2)
+        elif v["estado"] == "FORZADO_MANUAL":
+            g["forzados_count"] += 1
+            g["forzados_monto"] = round(g["forzados_monto"] + v["monto"], 2)
+            g["total_aprobado_count"] += 1
+            g["total_aprobado_monto"] = round(g["total_aprobado_monto"] + v["monto"], 2)
+        elif v["estado"] == "EN_ESPERA":
+            g["espera_count"] += 1
+            g["espera_monto"] = round(g["espera_monto"] + v["monto"], 2)
+
+    por_grupo = sorted(grupos_map.values(), key=lambda x: x["total_aprobado_monto"], reverse=True)
+
+    # Desglose por Banco
+    bancos_map: Dict[str, Dict[str, Any]] = {}
+    for d in depositos_dia:
+        banco = d.get("banco") or "Banco"
+        if banco not in bancos_map:
+            bancos_map[banco] = {
+                "banco": banco,
+                "entradas_count": 0,
+                "entradas_monto": 0.0,
+                "usados_count": 0,
+                "usados_monto": 0.0,
+                "libres_count": 0,
+                "libres_monto": 0.0,
+            }
+        b = bancos_map[banco]
+        b["entradas_count"] += 1
+        b["entradas_monto"] = round(b["entradas_monto"] + d["monto"], 2)
+        if d["estado"] == "USADO":
+            b["usados_count"] += 1
+            b["usados_monto"] = round(b["usados_monto"] + d["monto"], 2)
+        elif d["estado"] == "LIBRE":
+            b["libres_count"] += 1
+            b["libres_monto"] = round(b["libres_monto"] + d["monto"], 2)
+
+    por_banco = sorted(bancos_map.values(), key=lambda x: x["entradas_monto"], reverse=True)
+
+    # Armar texto listo para WhatsApp
+    lineas_wa = [
+        f"🌙 *CIERRE DE CAJA — {fecha}*",
+        f"✅ Conciliados: *{len(conciliados)}* | *R$ {total_conciliado:,.2f}*",
+    ]
+    if forzados:
+        lineas_wa.append(f"🔓 Forzados manual: *{len(forzados)}* | *R$ {total_forzado:,.2f}*")
+    lineas_wa.append(f"💰 *TOTAL APROBADO: R$ {total_aprobado:,.2f}*")
+    lineas_wa.append(f"🏦 Entradas extracto día: *{len(depositos_dia)}* | *R$ {total_depositos_dia:,.2f}*")
+
+    if por_grupo:
+        lineas_wa.append("")
+        lineas_wa.append("📲 *POR GRUPO WHATSAPP:*")
+        for g in por_grupo:
+            extra = f" (incl. {g['forzados_count']} manual)" if g["forzados_count"] else ""
+            lineas_wa.append(f"• {g['grupo']}: *{g['total_aprobado_count']}* ops | *R$ {g['total_aprobado_monto']:,.2f}*{extra}")
+
+    if por_banco:
+        lineas_wa.append("")
+        lineas_wa.append("🏦 *POR BANCO:*")
+        for b in por_banco:
+            lineas_wa.append(f"• {b['banco']}: R$ {b['entradas_monto']:,.2f} ({b['usados_count']} usados / {b['libres_count']} libres)")
+
+    alertas_wa = []
+    if vouchers_espera:
+        alertas_wa.append(f"🔴 En espera: {len(vouchers_espera)} (R$ {total_espera:,.2f})")
+    if forzados:
+        alertas_wa.append(f"🟠 Forzados sin depósito: {len(forzados)} (R$ {total_forzado:,.2f})")
+    if depositos_libres:
+        alertas_wa.append(f"🟡 Depósitos libres sin dueño: {len(depositos_libres)} (R$ {total_libres_dia:,.2f})")
+
+    if alertas_wa:
+        lineas_wa.append("")
+        lineas_wa.append("⚠️ *PENDIENTES / ALERTAS:*")
+        lineas_wa.extend(alertas_wa)
+    else:
+        lineas_wa.append("")
+        lineas_wa.append("✨ *Caja limpia: sin pendientes ni depósitos sueltos.*")
+
+    if cierre_guardado:
+        lineas_wa.append("")
+        lineas_wa.append(
+            f"🧮 Saldo Inicial: R$ {cierre_guardado['saldo_inicial_brl']:,.2f} | "
+            f"Salidas: R$ {cierre_guardado['salidas_brl']:,.2f} | "
+            f"Teórico: R$ {cierre_guardado['saldo_final_teorico_brl']:,.2f}"
+        )
+        if cierre_guardado.get("saldo_final_real_brl") is not None:
+            dif = cierre_guardado.get("diferencia_brl", 0.0)
+            marca = "✅ CUADRA" if abs(dif) < 0.01 else ("📈 SOBRANTE" if dif > 0 else "📉 FALTANTE")
+            lineas_wa.append(f"💵 Saldo Real Banco: R$ {cierre_guardado['saldo_final_real_brl']:,.2f} ({marca}: R$ {dif:,.2f})")
+
+    return {
+        "fecha": fecha,
+        "estado_caja": cierre_guardado["estado"] if cierre_guardado else "ABIERTO",
+        "cierre_guardado": cierre_guardado,
+        "totales": {
+            "conciliados_count": len(conciliados),
+            "conciliados_monto": total_conciliado,
+            "forzados_count": len(forzados),
+            "forzados_monto": total_forzado,
+            "aprobado_count": len(conciliados) + len(forzados),
+            "aprobado_monto": total_aprobado,
+            "espera_count": len(vouchers_espera),
+            "espera_monto": total_espera,
+            "depositos_dia_count": len(depositos_dia),
+            "depositos_dia_monto": total_depositos_dia,
+            "depositos_usados_count": len(depositos_usados),
+            "depositos_usados_monto": total_usados_dia,
+            "depositos_libres_count": len(depositos_libres),
+            "depositos_libres_monto": total_libres_dia,
+        },
+        "por_grupo": por_grupo,
+        "por_banco": por_banco,
+        "alertas": {
+            "vouchers_espera": vouchers_espera,
+            "vouchers_forzados": forzados,
+            "depositos_libres": depositos_libres,
+        },
+        "resumen_whatsapp": "\n".join(lineas_wa),
+    }
+
+
+def guardar_cierre_caja(
+    fecha: str,
+    saldo_inicial_brl: float = 0.0,
+    salidas_brl: float = 0.0,
+    saldo_final_real_brl: Optional[float] = None,
+    observaciones: str = ""
+) -> Dict[str, Any]:
+    """Guarda o actualiza el snapshot oficial del cierre de caja del día."""
+    import json as _json
+    resumen = get_resumen_cierre_dia(fecha)
+    tot = resumen["totales"]
+
+    saldo_teorico = round(saldo_inicial_brl + tot["depositos_dia_monto"] - salidas_brl, 2)
+    diferencia = round(saldo_final_real_brl - saldo_teorico, 2) if saldo_final_real_brl is not None else 0.0
+
+    now = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO cierres_caja (
+            fecha, estado, saldo_inicial_brl, salidas_brl,
+            saldo_final_teorico_brl, saldo_final_real_brl, diferencia_brl,
+            total_conciliado_brl, total_forzado_brl, total_espera_brl,
+            total_depositos_dia_brl, total_libres_brl,
+            observaciones, resumen_json, resumen_whatsapp, cerrado_en
+        ) VALUES (?, 'CERRADO', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(fecha) DO UPDATE SET
+            estado = 'CERRADO',
+            saldo_inicial_brl = excluded.saldo_inicial_brl,
+            salidas_brl = excluded.salidas_brl,
+            saldo_final_teorico_brl = excluded.saldo_final_teorico_brl,
+            saldo_final_real_brl = excluded.saldo_final_real_brl,
+            diferencia_brl = excluded.diferencia_brl,
+            total_conciliado_brl = excluded.total_conciliado_brl,
+            total_forzado_brl = excluded.total_forzado_brl,
+            total_espera_brl = excluded.total_espera_brl,
+            total_depositos_dia_brl = excluded.total_depositos_dia_brl,
+            total_libres_brl = excluded.total_libres_brl,
+            observaciones = excluded.observaciones,
+            resumen_json = excluded.resumen_json,
+            resumen_whatsapp = excluded.resumen_whatsapp,
+            cerrado_en = excluded.cerrado_en;
+    """, (
+        fecha, saldo_inicial_brl, salidas_brl,
+        saldo_teorico, saldo_final_real_brl, diferencia,
+        tot["conciliados_monto"], tot["forzados_monto"], tot["espera_monto"],
+        tot["depositos_dia_monto"], tot["depositos_libres_monto"],
+        observaciones, _json.dumps(resumen, ensure_ascii=False),
+        resumen["resumen_whatsapp"], now
+    ))
+    conn.commit()
+    conn.close()
+
+    # Releer resumen actualizado (ya incluye cierre_guardado en texto WhatsApp)
+    resumen_final = get_resumen_cierre_dia(fecha)
+    # Actualizar resumen_whatsapp con los saldos recién guardados
+    conn = get_db_connection()
+    conn.execute("UPDATE cierres_caja SET resumen_whatsapp = ? WHERE fecha = ?;", (resumen_final["resumen_whatsapp"], fecha))
+    conn.commit()
+    conn.close()
+    return resumen_final
+
+
+def get_historial_cierres(limite: int = 30) -> List[Dict[str, Any]]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, fecha, estado, saldo_inicial_brl, salidas_brl,
+               saldo_final_teorico_brl, saldo_final_real_brl, diferencia_brl,
+               total_conciliado_brl, total_forzado_brl, total_espera_brl,
+               total_depositos_dia_brl, total_libres_brl, observaciones, cerrado_en
+        FROM cierres_caja
+        ORDER BY fecha DESC LIMIT ?;
+    """, (limite,))
+    res = rows_to_list(cursor.fetchall())
+    conn.close()
+    return res
+
 
 # Inicializar DB al importar
 init_db()

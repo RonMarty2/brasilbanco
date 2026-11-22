@@ -1,3 +1,4 @@
+import unicodedata
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 from database import (
@@ -5,10 +6,28 @@ from database import (
     rows_to_list, 
     row_to_dict, 
     actualizar_voucher_estado,
-    registrar_auditoria
+    registrar_auditoria,
+    get_vouchers_pendientes
 )
 
 TOLERANCIA_CENTAVOS = 0.01  # Para comparaciones de coma flotante
+
+
+def _normalizar_banco(nombre: Optional[str]) -> str:
+    if not nombre:
+        return ""
+    s = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode("ascii").lower()
+    for ruido in ("banco", "s.a.", "s/a", "unibanco", "brasil", "pagamentos", "instituicao"):
+        s = s.replace(ruido, " ")
+    return " ".join(s.split())
+
+
+def _coincide_banco(banco_voucher: Optional[str], banco_deposito: Optional[str]) -> bool:
+    bv = _normalizar_banco(banco_voucher)
+    bd = _normalizar_banco(banco_deposito)
+    if not bv or not bd:
+        return False
+    return bv in bd or bd in bv
 
 def analizar_conciliacion_voucher(
     monto: float, 
@@ -71,6 +90,12 @@ def analizar_conciliacion_voucher(
     candidatos_libres = rows_to_list(cursor.fetchall())
 
     conn.close()
+
+    # Si hay varios candidatos y viene banco_destino, priorizar los que coincidan en banco
+    if len(candidatos_libres) > 1 and banco_destino:
+        filtrados_banco = [c for c in candidatos_libres if _coincide_banco(banco_destino, c.get("banco"))]
+        if filtrados_banco:
+            candidatos_libres = filtrados_banco
 
     total_candidatos = len(candidatos_libres)
 
@@ -178,7 +203,14 @@ def confirmar_conciliacion_reconciler(
         """, (voucher_id, deposito_id))
 
     # Auditoría
-    accion_audit = "DESEMPATE_MANUAL" if modo == "DESEMPATE" else ("FORZADO_MANUAL" if modo == "FORZADO" else "MATCH_AUTOMATICO")
+    if modo == "DESEMPATE":
+        accion_audit = "DESEMPATE_MANUAL"
+    elif modo == "FORZADO":
+        accion_audit = "FORZADO_MANUAL"
+    elif modo == "AUTO_RECRUCE":
+        accion_audit = "AUTO_RECRUCE"
+    else:
+        accion_audit = "MATCH_AUTOMATICO"
     cursor.execute("""
         INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles)
         VALUES (?, ?, ?, ?);
@@ -193,4 +225,46 @@ def confirmar_conciliacion_reconciler(
         "deposito_id": deposito_id,
         "estado": estado_final,
         "fecha_conciliacion": now
+    }
+
+
+def recruzar_pendientes_automatico() -> Dict[str, Any]:
+    """
+    Re-evalúa todos los vouchers EN_ESPERA contra los depósitos libres disponibles
+    y concilia automáticamente los que tengan coincidencia exacta única.
+    """
+    import sheets_sync
+
+    pendientes = get_vouchers_pendientes()
+    resueltos: List[Dict[str, Any]] = []
+
+    for v in pendientes:
+        diag = analizar_conciliacion_voucher(
+            monto=v["monto"],
+            fecha_comprobante=v["fecha_comprobante"],
+            id_transaccion_pix=v.get("id_transaccion_pix"),
+            banco_destino=v.get("banco_destino")
+        )
+        if diag["estado_diagnostico"] in ("MATCH_EXACTO", "MATCH_FECHA_ANTERIOR") and diag.get("deposito_id"):
+            confirmar_conciliacion_reconciler(
+                voucher_id=v["id"],
+                deposito_id=diag["deposito_id"],
+                modo="AUTO_RECRUCE",
+                observaciones="Conciliado automáticamente al cargar extracto"
+            )
+            sheets_sync.sincronizar_voucher_sheets(
+                {**v, "estado": "CONCILIADO", "deposito_asociado_id": diag["deposito_id"]},
+                estado_display="🟢 SÍ"
+            )
+            resueltos.append({
+                "voucher_id": v["id"],
+                "monto": v["monto"],
+                "grupo": v.get("grupo_whatsapp_nombre"),
+                "deposito_id": diag["deposito_id"]
+            })
+
+    return {
+        "resueltos_count": len(resueltos),
+        "resueltos": resueltos,
+        "pendientes_restantes": len(pendientes) - len(resueltos)
     }

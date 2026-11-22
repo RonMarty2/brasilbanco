@@ -15,7 +15,8 @@ const AppState = {
   depositoSeleccionadoId: null,
   modoOperacion: "AUTOMATICO",
   archivoGuardadoPath: "",
-  voucherPendienteEditandoId: null
+  voucherPendienteEditandoId: null,
+  cierreActual: null
 };
 
 // ========================================================
@@ -27,6 +28,7 @@ document.addEventListener("DOMContentLoaded", () => {
   cargarGruposWhatsApp();
   initVoucherUpload();
   initActionButtons();
+  initCierreCaja();
   cargarEstadisticas();
   cargarPendientes();
   cargarDepositosLibres();
@@ -103,6 +105,7 @@ function initTabs() {
         cargarEstadisticas();
         cargarHistorial();
       }
+      if (targetId === "tab-cierre") cargarCierreCaja();
     });
   });
 }
@@ -213,7 +216,10 @@ async function procesarArchivoVoucher(archivo) {
       body: formData
     });
 
-    if (!res.ok) throw new Error("Error en el servidor al analizar voucher");
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.detail || "Error en el servidor al analizar voucher");
+    }
 
     const data = await res.json();
     loadingEl.classList.add("hidden");
@@ -227,7 +233,11 @@ async function procesarArchivoVoucher(archivo) {
     renderDiagnostico(data.diagnostico);
 
     resultadoEl.classList.remove("hidden");
-    showToast("Voucher analizado con éxito", "success");
+    if (data.datos_extraidos?._es_mock) {
+      showToast(data.datos_extraidos._aviso || "Modo simulación activo", "warning");
+    } else {
+      showToast("Voucher analizado con éxito", "success");
+    }
 
   } catch (err) {
     loadingEl.classList.add("hidden");
@@ -501,6 +511,7 @@ function initActionButtons() {
   // Carga de Extractos (Vía B / archivo)
   document.getElementById("btn-upload-extracto").addEventListener("click", uploadExtractoManual);
   document.getElementById("btn-refresh-pendientes").addEventListener("click", cargarPendientes);
+  document.getElementById("btn-recruzar-todos").addEventListener("click", recruzarTodosPendientes);
   document.getElementById("btn-refresh-historial").addEventListener("click", () => {
     cargarEstadisticas();
     cargarHistorial();
@@ -665,6 +676,26 @@ async function forzarVoucherDirecto(item) {
   }
 }
 
+async function recruzarTodosPendientes() {
+  try {
+    const res = await fetch(`${API_BASE}/api/vouchers/recruzar-pendientes`, {
+      method: "POST"
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Error al re-cruzar pendientes");
+
+    if (data.resueltos_count > 0) {
+      showToast(`⚡ Se conciliaron ${data.resueltos_count} voucher(s) automáticamente (${data.pendientes_restantes} restante(s))`, "success");
+    } else {
+      showToast(`Sin coincidencias exactas nuevas (${data.pendientes_restantes} en espera)`, "info");
+    }
+    cargarPendientes();
+    cargarEstadisticas();
+  } catch (err) {
+    showToast("Error al re-cruzar pendientes: " + err.message, "error");
+  }
+}
+
 // ========================================================
 // EXTRACTOS BANCARIOS (VÍA B Y EXTENSIÓN)
 // ========================================================
@@ -690,8 +721,16 @@ async function uploadExtractoManual() {
     });
 
     const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || "Error en el servidor al procesar extracto");
+    }
+
     if (data.success) {
       showToast(`✅ Se agregaron ${data.insertados} depósitos libres al bolsón`, "success");
+      if (data.recruce_pendientes?.resueltos_count > 0) {
+        showToast(`⚡ ${data.recruce_pendientes.resueltos_count} voucher(s) EN ESPERA conciliados automáticamente`, "success");
+        cargarPendientes();
+      }
       fileInput.value = "";
       cargarDepositosLibres();
       cargarEstadisticas();
@@ -788,16 +827,23 @@ async function cargarHistorial() {
         estadoBadge = `<span class="bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🔓 SÍ (MANUAL)</span>`;
       } else if (v.estado === "EN_ESPERA") {
         estadoBadge = `<span class="bg-rose-500/20 text-rose-400 border border-rose-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🔴 ESPERA</span>`;
+      } else if (v.estado === "ANULADO") {
+        estadoBadge = `<span class="bg-slate-700/50 text-slate-300 border border-slate-600/50 px-2 py-0.5 rounded text-[10px] font-bold">⚪ ANULADO</span>`;
       }
+
+      const puedeAnular = v.estado === "CONCILIADO" || v.estado === "FORZADO_MANUAL";
 
       card.className = "bg-slate-900 border border-slate-800 rounded-xl p-3 space-y-1.5 shadow-sm";
       card.innerHTML = `
-        <div class="flex items-center justify-between">
-          <div class="flex items-center space-x-2">
+        <div class="flex items-center justify-between gap-2">
+          <div class="flex items-center space-x-2 min-w-0">
             ${estadoBadge}
-            <span class="text-xs font-bold text-white">#${v.id} - ${v.grupo_whatsapp_nombre}</span>
+            <span class="text-xs font-bold text-white truncate">#${v.id} - ${v.grupo_whatsapp_nombre}</span>
           </div>
-          <span class="font-mono text-sm font-extrabold text-white">R$ ${v.monto.toFixed(2)}</span>
+          <div class="flex items-center gap-2 shrink-0">
+            <span class="font-mono text-sm font-extrabold text-white">R$ ${v.monto.toFixed(2)}</span>
+            ${puedeAnular ? `<button type="button" class="btn-anular-voucher px-2 py-0.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-[10px] font-semibold transition">🗑️ Anular</button>` : ""}
+          </div>
         </div>
         <div class="text-[11px] text-slate-400 flex justify-between">
           <span>De: ${v.pagador_nombre || 'N/A'}</span>
@@ -807,9 +853,262 @@ async function cargarHistorial() {
           ${v.id_transaccion_pix ? `PIX: ${v.id_transaccion_pix}` : `Banco: ${v.banco_destino || 'N/A'}`}
         </div>
       `;
+
+      if (puedeAnular) {
+        card.querySelector(".btn-anular-voucher").addEventListener("click", async () => {
+          if (!confirm(`¿Seguro que deseas ANULAR el voucher #${v.id} (R$ ${v.monto.toFixed(2)})? Si tenía depósito asociado, quedará libre nuevamente.`)) {
+            return;
+          }
+          try {
+            const res = await fetch(`${API_BASE}/api/vouchers/${v.id}/anular`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ motivo: "Corrección manual desde historial" })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || "No se pudo anular el voucher");
+
+            showToast(
+              data.deposito_liberado
+                ? `⚪ Voucher #${v.id} anulado y depósito liberado`
+                : `⚪ Voucher #${v.id} anulado`,
+              "warning"
+            );
+            cargarHistorial();
+            cargarEstadisticas();
+            cargarDepositosLibres();
+          } catch (err) {
+            showToast("Error anulando voucher: " + err.message, "error");
+          }
+        });
+      }
+
       container.appendChild(card);
     });
   } catch (err) {
     console.error("Error cargando historial:", err);
+  }
+}
+
+// ========================================================
+// CIERRE DE CAJA NOCTURNO
+// ========================================================
+function formatearBRL(valor) {
+  const num = Number(valor) || 0;
+  return `R$ ${num.toLocaleString("es-BO", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function initCierreCaja() {
+  const fechaInput = document.getElementById("cierre-fecha");
+  const hoy = new Date().toISOString().split("T")[0];
+  if (fechaInput && !fechaInput.value) {
+    fechaInput.value = hoy;
+  }
+
+  fechaInput?.addEventListener("change", (e) => cargarCierreCaja(e.target.value));
+  document.getElementById("btn-refresh-cierre")?.addEventListener("click", () => {
+    cargarCierreCaja(fechaInput?.value);
+  });
+
+  ["cierre-saldo-inicial", "cierre-salidas", "cierre-saldo-real"].forEach((id) => {
+    document.getElementById(id)?.addEventListener("input", recalcularCuadreCierre);
+  });
+
+  document.getElementById("btn-copiar-whatsapp")?.addEventListener("click", copiarResumenWhatsApp);
+  document.getElementById("btn-confirmar-cierre")?.addEventListener("click", confirmarCierreCaja);
+}
+
+async function cargarCierreCaja(fechaParam) {
+  const fechaInput = document.getElementById("cierre-fecha");
+  const fecha = fechaParam || fechaInput?.value || new Date().toISOString().split("T")[0];
+  if (fechaInput) fechaInput.value = fecha;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/cierre-caja?fecha=${encodeURIComponent(fecha)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Error cargando cierre de caja");
+
+    AppState.cierreActual = data;
+    const tot = data.totales || {};
+
+    // Badge estado
+    const badge = document.getElementById("cierre-estado-badge");
+    if (data.estado_caja === "CERRADO") {
+      badge.textContent = "🔒 CERRADO";
+      badge.className = "inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40";
+    } else {
+      badge.textContent = "ABIERTO";
+      badge.className = "inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30";
+    }
+
+    // KPIs
+    document.getElementById("cierre-total-aprobado").textContent = formatearBRL(tot.aprobado_monto);
+    document.getElementById("cierre-count-aprobado").textContent = `${tot.aprobado_count || 0} ops (${tot.conciliados_count || 0} auto, ${tot.forzados_count || 0} manual)`;
+
+    document.getElementById("cierre-total-extracto").textContent = formatearBRL(tot.depositos_dia_monto);
+    document.getElementById("cierre-count-extracto").textContent = `${tot.depositos_dia_count || 0} entradas`;
+
+    document.getElementById("cierre-total-espera").textContent = formatearBRL(tot.espera_monto);
+    document.getElementById("cierre-count-espera").textContent = `${tot.espera_count || 0} pendientes`;
+
+    document.getElementById("cierre-total-libres").textContent = formatearBRL(tot.depositos_libres_monto);
+    document.getElementById("cierre-count-libres").textContent = `${tot.depositos_libres_count || 0} sin asignar`;
+
+    // Alertas
+    const alertasBox = document.getElementById("cierre-alertas-box");
+    const alertas = data.alertas || {};
+    const espera = alertas.vouchers_espera || [];
+    const forzados = alertas.vouchers_forzados || [];
+    const libres = alertas.depositos_libres || [];
+
+    if (espera.length === 0 && forzados.length === 0 && libres.length === 0) {
+      alertasBox.className = "bg-emerald-950/40 border border-emerald-500/30 rounded-2xl p-3.5 text-xs text-emerald-300";
+      alertasBox.innerHTML = `<p class="font-semibold">✨ Caja limpia: sin vouchers en espera, forzados ni depósitos sueltos.</p>`;
+    } else {
+      alertasBox.className = "bg-amber-950/30 border border-amber-500/40 rounded-2xl p-3.5 space-y-1.5 text-xs text-amber-200";
+      const items = [];
+      if (espera.length > 0) {
+        items.push(`<p>🔴 <strong>${espera.length}</strong> voucher(s) EN ESPERA (${formatearBRL(tot.espera_monto)})</p>`);
+      }
+      if (forzados.length > 0) {
+        items.push(`<p>🟠 <strong>${forzados.length}</strong> forzado(s) manual sin depósito (${formatearBRL(tot.forzados_monto)})</p>`);
+      }
+      if (libres.length > 0) {
+        items.push(`<p>🟡 <strong>${libres.length}</strong> depósito(s) libre(s) sin dueño (${formatearBRL(tot.depositos_libres_monto)})</p>`);
+      }
+      alertasBox.innerHTML = `<p class="font-bold text-amber-300 uppercase tracking-wider text-[11px]">⚠️ Alertas del Día</p>${items.join("")}`;
+    }
+
+    // Por Grupo
+    const porGrupoEl = document.getElementById("cierre-por-grupo");
+    const grupos = data.por_grupo || [];
+    if (grupos.length === 0) {
+      porGrupoEl.innerHTML = `<p class="text-slate-500">Sin movimientos registrados para esta fecha.</p>`;
+    } else {
+      porGrupoEl.innerHTML = grupos.map((g) => `
+        <div class="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-xl px-3 py-2">
+          <div>
+            <p class="font-semibold text-white">${g.grupo}</p>
+            <p class="text-[10px] text-slate-400">${g.total_aprobado_count} aprobados${g.forzados_count ? ` (${g.forzados_count} manual)` : ""}${g.espera_count ? ` · ${g.espera_count} en espera` : ""}</p>
+          </div>
+          <span class="font-mono font-bold text-emerald-400">${formatearBRL(g.total_aprobado_monto)}</span>
+        </div>
+      `).join("");
+    }
+
+    // Por Banco
+    const porBancoEl = document.getElementById("cierre-por-banco");
+    const bancos = data.por_banco || [];
+    if (bancos.length === 0) {
+      porBancoEl.innerHTML = `<p class="text-slate-500">Sin entradas de extracto para esta fecha.</p>`;
+    } else {
+      porBancoEl.innerHTML = bancos.map((b) => `
+        <div class="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-xl px-3 py-2">
+          <div>
+            <p class="font-semibold text-white">${b.banco}</p>
+            <p class="text-[10px] text-slate-400">${b.entradas_count} entradas · ${b.usados_count} usados / ${b.libres_count} libres</p>
+          </div>
+          <span class="font-mono font-bold text-sky-400">${formatearBRL(b.entradas_monto)}</span>
+        </div>
+      `).join("");
+    }
+
+    // Precargar saldos si ya existía cierre guardado
+    const cg = data.cierre_guardado;
+    document.getElementById("cierre-saldo-inicial").value = cg ? cg.saldo_inicial_brl : 0;
+    document.getElementById("cierre-salidas").value = cg ? cg.salidas_brl : 0;
+    document.getElementById("cierre-saldo-real").value = cg && cg.saldo_final_real_brl !== null && cg.saldo_final_real_brl !== undefined ? cg.saldo_final_real_brl : "";
+    document.getElementById("cierre-observaciones").value = cg?.observaciones || "";
+
+    recalcularCuadreCierre();
+  } catch (err) {
+    showToast("Error cargando cierre: " + err.message, "error");
+  }
+}
+
+function recalcularCuadreCierre() {
+  const saldoInicial = parseFloat(document.getElementById("cierre-saldo-inicial")?.value) || 0;
+  const salidas = parseFloat(document.getElementById("cierre-salidas")?.value) || 0;
+  const depositosDia = AppState.cierreActual?.totales?.depositos_dia_monto || 0;
+
+  const teorico = saldoInicial + depositosDia - salidas;
+  document.getElementById("cierre-saldo-teorico").textContent = formatearBRL(teorico);
+
+  const saldoRealRaw = document.getElementById("cierre-saldo-real")?.value;
+  const difEl = document.getElementById("cierre-diferencia");
+  if (saldoRealRaw === "" || saldoRealRaw === undefined || saldoRealRaw === null) {
+    difEl.textContent = "—";
+    difEl.className = "text-sm font-extrabold font-mono text-slate-400 mt-0.5";
+    return;
+  }
+
+  const saldoReal = parseFloat(saldoRealRaw) || 0;
+  const diferencia = saldoReal - teorico;
+  if (Math.abs(diferencia) < 0.01) {
+    difEl.textContent = `${formatearBRL(0)} (CUADRA)`;
+    difEl.className = "text-sm font-extrabold font-mono text-emerald-400 mt-0.5";
+  } else if (diferencia > 0) {
+    difEl.textContent = `+${formatearBRL(diferencia)} (SOBRANTE)`;
+    difEl.className = "text-sm font-extrabold font-mono text-amber-400 mt-0.5";
+  } else {
+    difEl.textContent = `${formatearBRL(diferencia)} (FALTANTE)`;
+    difEl.className = "text-sm font-extrabold font-mono text-rose-400 mt-0.5";
+  }
+}
+
+async function copiarResumenWhatsApp() {
+  const texto = AppState.cierreActual?.resumen_whatsapp;
+  if (!texto) {
+    showToast("No hay resumen disponible para copiar", "warning");
+    return;
+  }
+
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(texto);
+    } else {
+      throw new Error("Clipboard API no disponible");
+    }
+    showToast("📋 Resumen copiado para WhatsApp", "success");
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = texto;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    showToast("📋 Resumen copiado para WhatsApp", "success");
+  }
+}
+
+async function confirmarCierreCaja() {
+  const fecha = document.getElementById("cierre-fecha")?.value || new Date().toISOString().split("T")[0];
+  const saldoInicial = parseFloat(document.getElementById("cierre-saldo-inicial")?.value) || 0;
+  const salidas = parseFloat(document.getElementById("cierre-salidas")?.value) || 0;
+  const saldoRealRaw = document.getElementById("cierre-saldo-real")?.value;
+  const saldoReal = saldoRealRaw !== "" && saldoRealRaw !== undefined ? parseFloat(saldoRealRaw) : null;
+  const observaciones = document.getElementById("cierre-observaciones")?.value || "";
+
+  try {
+    const res = await fetch(`${API_BASE}/api/cierre-caja/cerrar`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fecha,
+        saldo_inicial_brl: saldoInicial,
+        salidas_brl: salidas,
+        saldo_final_real_brl: saldoReal,
+        observaciones
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Error al guardar el cierre");
+
+    showToast(`🔒 Cierre de caja ${fecha} guardado correctamente`, "success");
+    await cargarCierreCaja(fecha);
+  } catch (err) {
+    showToast("Error cerrando caja: " + err.message, "error");
   }
 }

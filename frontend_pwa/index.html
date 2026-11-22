@@ -234,14 +234,19 @@
     <!-- PESTAÑA 2: EN ESPERA / PENDIENTES -->
     <!-- ---------------------------------------- -->
     <section id="tab-pendientes" class="tab-content hidden space-y-4">
-      <div class="flex items-center justify-between">
+      <div class="flex items-center justify-between gap-2">
         <div>
           <h2 class="text-base font-bold text-white">Vouchers en Espera</h2>
           <p class="text-xs text-slate-400">Comprobantes pendientes de depósito en extracto</p>
         </div>
-        <button id="btn-refresh-pendientes" class="p-2 bg-slate-900 border border-slate-800 text-slate-300 rounded-xl text-xs hover:bg-slate-800">
-          🔄 Actualizar
-        </button>
+        <div class="flex items-center gap-2">
+          <button id="btn-recruzar-todos" class="px-2.5 py-2 bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 rounded-xl text-xs font-semibold hover:bg-emerald-500/25 transition">
+            ⚡ Re-cruzar Todos
+          </button>
+          <button id="btn-refresh-pendientes" class="p-2 bg-slate-900 border border-slate-800 text-slate-300 rounded-xl text-xs hover:bg-slate-800">
+            🔄 Actualizar
+          </button>
+        </div>
       </div>
 
       <div id="lista-pendientes" class="space-y-3">
@@ -331,13 +336,135 @@
 
     </section>
 
+    <!-- ---------------------------------------- -->
+    <!-- PESTAÑA 5: CIERRE DE CAJA NOCTURNO -->
+    <!-- ---------------------------------------- -->
+    <section id="tab-cierre" class="tab-content hidden space-y-4">
+
+      <!-- Cabecera y selector de fecha -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 shadow-sm space-y-3">
+        <div class="flex items-center justify-between gap-2">
+          <div>
+            <h2 class="text-base font-bold text-white flex items-center gap-1.5">
+              <span>🌙</span>
+              <span>Cierre de Caja Nocturno</span>
+            </h2>
+            <p class="text-[11px] text-slate-400">Cuadre diario de remesas y extractos</p>
+          </div>
+          <span id="cierre-estado-badge" class="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+            ABIERTO
+          </span>
+        </div>
+        <div class="flex items-center gap-2">
+          <input type="date" id="cierre-fecha" class="flex-1 bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-xs text-white focus:outline-none">
+          <button type="button" id="btn-refresh-cierre" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition">
+            🔄
+          </button>
+        </div>
+      </div>
+
+      <!-- 4 Tarjetas KPI -->
+      <div class="grid grid-cols-2 gap-3">
+        <div class="bg-slate-900 border border-emerald-500/30 rounded-2xl p-3.5 shadow-sm">
+          <p class="text-[11px] text-slate-400 font-medium">Total Aprobado</p>
+          <p class="text-lg font-extrabold text-emerald-400 mt-0.5 font-mono" id="cierre-total-aprobado">R$ 0,00</p>
+          <p class="text-[10px] text-slate-400 mt-1" id="cierre-count-aprobado">0 vouchers</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 shadow-sm">
+          <p class="text-[11px] text-slate-400 font-medium">Extracto del Día</p>
+          <p class="text-lg font-extrabold text-sky-400 mt-0.5 font-mono" id="cierre-total-extracto">R$ 0,00</p>
+          <p class="text-[10px] text-slate-400 mt-1" id="cierre-count-extracto">0 entradas</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 shadow-sm">
+          <p class="text-[11px] text-slate-400 font-medium">En Espera</p>
+          <p class="text-lg font-extrabold text-rose-400 mt-0.5 font-mono" id="cierre-total-espera">R$ 0,00</p>
+          <p class="text-[10px] text-slate-400 mt-1" id="cierre-count-espera">0 pendientes</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 shadow-sm">
+          <p class="text-[11px] text-slate-400 font-medium">Depósitos Libres</p>
+          <p class="text-lg font-extrabold text-amber-400 mt-0.5 font-mono" id="cierre-total-libres">R$ 0,00</p>
+          <p class="text-[10px] text-slate-400 mt-1" id="cierre-count-libres">0 sin asignar</p>
+        </div>
+      </div>
+
+      <!-- Caja de Alertas -->
+      <div id="cierre-alertas-box" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-2 text-xs">
+        <!-- Renderizado dinámico -->
+      </div>
+
+      <!-- Desglose por Grupo de WhatsApp -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-2.5">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">📲 Desglose por Grupo de WhatsApp</h3>
+        <div id="cierre-por-grupo" class="space-y-2 text-xs">
+          <!-- Renderizado dinámico -->
+        </div>
+      </div>
+
+      <!-- Desglose por Banco en Brasil -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-2.5">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">🏦 Desglose por Banco en Brasil</h3>
+        <div id="cierre-por-banco" class="space-y-2 text-xs">
+          <!-- Renderizado dinámico -->
+        </div>
+      </div>
+
+      <!-- Cuadre de Saldos (R$ BRL) -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow-md">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">🧮 Cuadre de Saldos (R$ BRL)</h3>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">Saldo Inicial (R$)</label>
+            <input type="number" step="0.01" id="cierre-saldo-inicial" value="0" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-sm font-mono text-white focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">Salidas / Pagos (R$)</label>
+            <input type="number" step="0.01" id="cierre-salidas" value="0" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-sm font-mono text-white focus:outline-none">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">Saldo Real en Banco (R$)</label>
+            <input type="number" step="0.01" id="cierre-saldo-real" placeholder="Opcional" class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-sm font-mono text-emerald-400 focus:outline-none">
+          </div>
+          <div>
+            <label class="block text-[11px] font-medium text-slate-400 mb-1">Observaciones</label>
+            <input type="text" id="cierre-observaciones" placeholder="Nota del cierre..." class="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 rounded-xl px-3 py-2 text-xs text-white focus:outline-none">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 pt-2 border-t border-slate-800">
+          <div class="bg-slate-950 border border-slate-800 rounded-xl p-2.5">
+            <p class="text-[10px] text-slate-400 uppercase">Saldo Teórico</p>
+            <p id="cierre-saldo-teorico" class="text-sm font-extrabold font-mono text-white mt-0.5">R$ 0,00</p>
+          </div>
+          <div class="bg-slate-950 border border-slate-800 rounded-xl p-2.5">
+            <p class="text-[10px] text-slate-400 uppercase">Diferencia</p>
+            <p id="cierre-diferencia" class="text-sm font-extrabold font-mono text-slate-400 mt-0.5">—</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Botones de Acción -->
+      <div class="space-y-2 pt-1">
+        <button type="button" id="btn-copiar-whatsapp" class="w-full py-3 px-4 bg-slate-800 hover:bg-slate-700 border border-emerald-500/40 text-emerald-300 font-bold rounded-2xl text-xs flex items-center justify-center gap-2 transition">
+          📋 Copiar Resumen para WhatsApp
+        </button>
+        <button type="button" id="btn-confirmar-cierre" class="w-full py-3.5 px-4 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-extrabold rounded-2xl shadow-lg shadow-emerald-600/20 text-xs uppercase flex items-center justify-center gap-2 transition">
+          🔒 Guardar y Cerrar Caja del Día
+        </button>
+      </div>
+
+    </section>
+
   </main>
 
   <!-- ========================================== -->
   <!-- BARRA DE NAVEGACIÓN INFERIOR (PWA MOBILE) -->
   <!-- ========================================== -->
   <nav class="fixed bottom-0 inset-x-0 z-40 bg-slate-900/95 backdrop-blur-lg border-t border-slate-800 px-2 py-2">
-    <div class="max-w-xl mx-auto grid grid-cols-4 gap-1">
+    <div class="max-w-xl mx-auto grid grid-cols-5 gap-1">
       
       <button type="button" class="nav-tab active flex flex-col items-center py-1 text-emerald-400 transition" data-target="tab-escanear">
         <span class="text-lg">📸</span>
@@ -360,6 +487,11 @@
       <button type="button" class="nav-tab flex flex-col items-center py-1 text-slate-400 hover:text-slate-200 transition" data-target="tab-historial">
         <span class="text-lg">📊</span>
         <span class="text-[10px] font-medium mt-0.5">Historial</span>
+      </button>
+
+      <button type="button" class="nav-tab flex flex-col items-center py-1 text-slate-400 hover:text-slate-200 transition" data-target="tab-cierre">
+        <span class="text-lg">🌙</span>
+        <span class="text-[10px] font-medium mt-0.5">Cierre</span>
       </button>
 
     </div>

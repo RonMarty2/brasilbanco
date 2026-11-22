@@ -105,6 +105,16 @@ class ExtractoImportJSON(BaseModel):
     banco: str
     depositos: List[DepositoItem]
 
+class AnularVoucherRequest(BaseModel):
+    motivo: Optional[str] = "Corrección manual"
+
+class CierreCajaRequest(BaseModel):
+    fecha: Optional[str] = None
+    saldo_inicial_brl: float = 0.0
+    salidas_brl: float = 0.0
+    saldo_final_real_brl: Optional[float] = None
+    observaciones: Optional[str] = ""
+
 
 # ----------------------------------------------------
 # ENDPOINTS: GRUPOS DE WHATSAPP
@@ -150,7 +160,10 @@ async def analizar_voucher_archivo(
         f.write(contenido)
 
     # 1. Extraer datos con Gemini Vision
-    datos_ia = ai_vision.extraer_datos_voucher(contenido, mime_type)
+    try:
+        datos_ia = ai_vision.extraer_datos_voucher(contenido, mime_type)
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
     monto = float(datos_ia.get("monto", 0.0) or 0.0)
     fecha_comprobante = datos_ia.get("fecha") or datetime.now().strftime("%Y-%m-%d")
@@ -382,7 +395,10 @@ async def upload_extracto_archivo(
 
     if ext in [".jpg", ".jpeg", ".png", ".webp", ".pdf"]:
         mime = "application/pdf" if ext == ".pdf" else "image/jpeg"
-        depositos_extraidos = ai_vision.extraer_datos_extracto(contenido, mime, banco or "Banco")
+        try:
+            depositos_extraidos = ai_vision.extraer_datos_extracto(contenido, mime, banco or "Banco")
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
     elif ext == ".csv":
         # Parseo simple de CSV bancario
         lineas = contenido.decode("utf-8", errors="ignore").splitlines()
@@ -407,19 +423,24 @@ async def upload_extracto_archivo(
                     continue
     else:
         # Formato no soportado directamente, intentar con IA
-        depositos_extraidos = ai_vision.extraer_datos_extracto(contenido, "image/jpeg", banco or "Banco")
+        try:
+            depositos_extraidos = ai_vision.extraer_datos_extracto(contenido, "image/jpeg", banco or "Banco")
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
 
     for d in depositos_extraidos:
         d["archivo_fuente"] = str(ruta_guardado.relative_to(BASE_DIR))
 
     insertados = db.guardar_depositos_extracto(depositos_extraidos)
+    recruce = reconciler.recruzar_pendientes_automatico()
 
     return {
         "success": True,
         "insertados": insertados,
         "total_extraidos": len(depositos_extraidos),
         "archivo": nombre_archivo,
-        "depositos": depositos_extraidos
+        "depositos": depositos_extraidos,
+        "recruce_pendientes": recruce
     }
 
 
@@ -436,12 +457,14 @@ def import_extracto_json(payload: ExtractoImportJSON):
         depositos_list.append(d)
 
     insertados = db.guardar_depositos_extracto(depositos_list)
+    recruce = reconciler.recruzar_pendientes_automatico()
 
     return {
         "success": True,
         "insertados": insertados,
         "total_recibidos": len(depositos_list),
-        "banco": payload.banco
+        "banco": payload.banco,
+        "recruce_pendientes": recruce
     }
 
 
@@ -449,6 +472,49 @@ def import_extracto_json(payload: ExtractoImportJSON):
 def listar_extractos_libres(fecha: Optional[str] = None):
     """Devuelve los depósitos aún disponibles en el 'Bolsón de Depósitos Libres'."""
     return db.get_depositos_libres(fecha)
+
+
+# ----------------------------------------------------
+# ENDPOINTS: ANULACIÓN, RECRUCE Y CIERRE DE CAJA
+# ----------------------------------------------------
+@app.post("/api/vouchers/{voucher_id}/anular")
+def anular_voucher_endpoint(voucher_id: int, payload: Optional[AnularVoucherRequest] = None):
+    motivo = payload.motivo if payload else "Corrección manual"
+    res = db.anular_voucher(voucher_id, motivo)
+    if not res["success"]:
+        raise HTTPException(status_code=404, detail=res.get("error", "Voucher no encontrado"))
+    sheets_sync.sincronizar_voucher_sheets(res["voucher"], estado_display="⚪ ANULADO")
+    return res
+
+
+@app.post("/api/vouchers/recruzar-pendientes")
+def recruzar_pendientes_endpoint():
+    return reconciler.recruzar_pendientes_automatico()
+
+
+@app.get("/api/cierre-caja")
+def obtener_cierre_caja(fecha: Optional[str] = None):
+    fecha_obj = fecha or datetime.now().strftime("%Y-%m-%d")
+    return db.get_resumen_cierre_dia(fecha_obj)
+
+
+@app.post("/api/cierre-caja/cerrar")
+def cerrar_caja_dia(payload: CierreCajaRequest):
+    fecha_obj = payload.fecha or datetime.now().strftime("%Y-%m-%d")
+    resumen = db.guardar_cierre_caja(
+        fecha=fecha_obj,
+        saldo_inicial_brl=payload.saldo_inicial_brl,
+        salidas_brl=payload.salidas_brl,
+        saldo_final_real_brl=payload.saldo_final_real_brl,
+        observaciones=payload.observaciones or ""
+    )
+    sheets_res = sheets_sync.sincronizar_cierre_sheets(resumen)
+    return {"success": True, "cierre": resumen, "sheets_result": sheets_res}
+
+
+@app.get("/api/cierre-caja/historial")
+def obtener_historial_cierres(limite: int = 30):
+    return db.get_historial_cierres(limite)
 
 
 # ----------------------------------------------------
