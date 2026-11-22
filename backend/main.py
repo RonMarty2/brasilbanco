@@ -1,15 +1,16 @@
 import os
 import shutil
 import json
-from datetime import datetime
+import sqlite3
+from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Cargar variables de entorno
@@ -20,18 +21,37 @@ import database as db
 import ai_vision
 import reconciler
 import sheets_sync
+import parsers
+import backup
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+EXTENSIONES_IMAGEN_PDF = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        backup.respaldar()
+    except Exception as e:
+        print(f"[BACKUP] No se pudo crear respaldo inicial: {e}")
+    yield
+
 
 app = FastAPI(
     title="Sistema Semi-Automático de Conciliación de Remesas (Brasil ⇄ Bolivia)",
     version="1.0.0",
-    description="Backend FastAPI con SQLite, Gemini Vision y Google Sheets"
+    description="Backend FastAPI con SQLite, Gemini Vision y Google Sheets",
+    lifespan=lifespan,
 )
 
 # Configurar CORS para permitir comunicación con PWA y Extensión de Chrome
+_cors_env = os.getenv("CORS_ORIGINS", "*")
+_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,23 +64,78 @@ PWA_DIR = BASE_DIR / "frontend_pwa"
 
 
 def get_directorio_hoy(subtipo: str = "vouchers") -> Path:
-    hoy = datetime.now().strftime("%Y-%m-%d")
+    hoy = db.hoy_negocio()
     d = STORAGE_HISTORIAL / hoy / subtipo
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
+def _estado_display_sheets(estado: str) -> str:
+    return {
+        "CONCILIADO": "🟢 SÍ",
+        "FORZADO_MANUAL": "🟢 SÍ (MANUAL)",
+        "EN_ESPERA": "🔴 EN ESPERA",
+        "ANULADO": "⚪ ANULADO",
+    }.get(estado, estado or "PENDIENTE")
+
+
+def _sincronizar_y_marcar_sheets(voucher: Dict[str, Any], estado_display: str) -> Dict[str, Any]:
+    sheets_res = sheets_sync.sincronizar_voucher_sheets(voucher, estado_display=estado_display)
+    vid = voucher.get("id")
+    if vid is not None:
+        db.marcar_sheets_sync(
+            int(vid),
+            bool(sheets_res.get("success") and not sheets_res.get("simulado")),
+            sheets_res.get("error"),
+        )
+    return sheets_res
+
+
+# ----------------------------------------------------
+# AUTENTICACIÓN Y ROLES
+# ----------------------------------------------------
+def usuario_actual(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    if os.getenv("AUTH_DISABLED", "false").lower() in ("1", "true", "yes"):
+        return {"id": 0, "nombre": "Back-office", "rol": "dueno"}
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="No autenticado")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    user = db.get_usuario_por_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+    return user
+
+
+def requerir_roles(*roles: str):
+    def _verificar_rol(user: Dict[str, Any] = Depends(usuario_actual)) -> Dict[str, Any]:
+        if user.get("rol") not in roles:
+            raise HTTPException(status_code=403, detail="No tienes permisos para realizar esta acción")
+        return user
+    return _verificar_rol
+
+
 # ----------------------------------------------------
 # MODELOS DE ENTRADA
 # ----------------------------------------------------
+class LoginRequest(BaseModel):
+    nombre: str
+    pin: str
+
+class UsuarioCreate(BaseModel):
+    nombre: str
+    pin: str
+    rol: str = "operador"
+
 class GrupoCreate(BaseModel):
     nombre: str
     color: Optional[str] = "#10B981"
 
 class VoucherConfirmacion(BaseModel):
     id: Optional[int] = None
-    monto: float
-    fecha_comprobante: str
+    monto: float = Field(gt=0)
+    fecha_comprobante: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     hora_comprobante: Optional[str] = ""
     pagador_nombre: Optional[str] = ""
     pagador_documento: Optional[str] = ""
@@ -80,8 +155,8 @@ class VoucherConfirmacion(BaseModel):
 
 class VoucherEnEspera(BaseModel):
     id: Optional[int] = None
-    monto: float
-    fecha_comprobante: str
+    monto: float = Field(gt=0)
+    fecha_comprobante: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     hora_comprobante: Optional[str] = ""
     pagador_nombre: Optional[str] = ""
     receptor_nombre: Optional[str] = ""
@@ -93,10 +168,10 @@ class VoucherEnEspera(BaseModel):
     observaciones: Optional[str] = ""
 
 class DepositoItem(BaseModel):
-    banco: str
-    fecha: str
+    banco: Optional[str] = None
+    fecha: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     hora: Optional[str] = None
-    monto: float
+    monto: float = Field(gt=0)
     descripcion: str
     id_transaccion_pix: Optional[str] = None
     tipo: Optional[str] = "PIX_IN"
@@ -109,7 +184,7 @@ class AnularVoucherRequest(BaseModel):
     motivo: Optional[str] = "Corrección manual"
 
 class CierreCajaRequest(BaseModel):
-    fecha: Optional[str] = None
+    fecha: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     saldo_inicial_brl: float = 0.0
     salidas_brl: float = 0.0
     saldo_final_real_brl: Optional[float] = None
@@ -117,14 +192,43 @@ class CierreCajaRequest(BaseModel):
 
 
 # ----------------------------------------------------
+# ENDPOINTS: AUTENTICACIÓN
+# ----------------------------------------------------
+@app.post("/api/auth/login")
+def login(payload: LoginRequest):
+    sesion = db.autenticar_usuario(payload.nombre, payload.pin)
+    if not sesion:
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    return sesion
+
+
+@app.get("/api/auth/yo")
+def quien_soy(user: Dict[str, Any] = Depends(usuario_actual)):
+    return user
+
+
+@app.post("/api/auth/usuarios")
+def crear_nuevo_usuario(
+    payload: UsuarioCreate,
+    user: Dict[str, Any] = Depends(requerir_roles("dueno"))
+):
+    if payload.rol not in ("dueno", "supervisor", "operador"):
+        raise HTTPException(status_code=400, detail="Rol inválido. Debe ser dueno, supervisor u operador")
+    try:
+        return db.crear_usuario(payload.nombre, payload.pin, payload.rol)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese nombre")
+
+
+# ----------------------------------------------------
 # ENDPOINTS: GRUPOS DE WHATSAPP
 # ----------------------------------------------------
 @app.get("/api/grupos")
-def listar_grupos():
+def listar_grupos(user: Dict[str, Any] = Depends(usuario_actual)):
     return db.get_grupos()
 
 @app.post("/api/grupos")
-def crear_nuevo_grupo(grupo: GrupoCreate):
+def crear_nuevo_grupo(grupo: GrupoCreate, user: Dict[str, Any] = Depends(usuario_actual)):
     try:
         gid = db.crear_grupo(grupo.nombre, grupo.color or "#10B981")
         return {"id": gid, "nombre": grupo.nombre, "color": grupo.color}
@@ -139,7 +243,8 @@ def crear_nuevo_grupo(grupo: GrupoCreate):
 async def analizar_voucher_archivo(
     archivo: UploadFile = File(...),
     grupo_whatsapp_id: Optional[int] = Form(None),
-    grupo_whatsapp_nombre: Optional[str] = Form("General")
+    grupo_whatsapp_nombre: Optional[str] = Form("General"),
+    user: Dict[str, Any] = Depends(usuario_actual)
 ):
     """
     1. Guarda el archivo en storage/Historial/YYYY-MM-DD/vouchers/
@@ -148,12 +253,15 @@ async def analizar_voucher_archivo(
     4. Devuelve los campos editables + diagnóstico al frontend (Human-in-the-Loop)
     """
     contenido = await archivo.read()
+    if len(contenido) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Archivo demasiado grande (máximo 10 MB)")
     mime_type = archivo.content_type or "image/jpeg"
-    ext = Path(archivo.filename or "voucher.jpg").suffix or ".jpg"
+    nombre_limpio = Path(archivo.filename or "voucher.jpg").name
+    ext = Path(nombre_limpio).suffix or ".jpg"
     
     # Guardar archivo físicamente
     dir_destino = get_directorio_hoy("vouchers")
-    timestamp = datetime.now().strftime("%H%M%S_%f")
+    timestamp = db.ahora_negocio().strftime("%H%M%S_%f")
     nombre_guardado = f"voucher_{timestamp}{ext}"
     ruta_guardado = dir_destino / nombre_guardado
     with open(ruta_guardado, "wb") as f:
@@ -166,7 +274,7 @@ async def analizar_voucher_archivo(
         raise HTTPException(status_code=502, detail=str(e))
 
     monto = float(datos_ia.get("monto", 0.0) or 0.0)
-    fecha_comprobante = datos_ia.get("fecha") or datetime.now().strftime("%Y-%m-%d")
+    fecha_comprobante = datos_ia.get("fecha") or db.hoy_negocio()
     id_pix = datos_ia.get("id_transaccion_pix")
 
     # 2. Diagnóstico de conciliación automático
@@ -191,7 +299,8 @@ def reanalizar_voucher_manual(
     monto: float = Form(...),
     fecha_comprobante: str = Form(...),
     id_transaccion_pix: Optional[str] = Form(None),
-    banco_destino: Optional[str] = Form(None)
+    banco_destino: Optional[str] = Form(None),
+    user: Dict[str, Any] = Depends(usuario_actual)
 ):
     """Permite recalcular el diagnóstico cuando el usuario edita el monto o fecha en la PWA con su dedo."""
     diagnostico = reconciler.analizar_conciliacion_voucher(
@@ -204,17 +313,21 @@ def reanalizar_voucher_manual(
 
 
 @app.post("/api/vouchers/confirmar")
-def confirmar_voucher(payload: VoucherConfirmacion):
+def confirmar_voucher(
+    payload: VoucherConfirmacion,
+    user: Dict[str, Any] = Depends(usuario_actual)
+):
     """
     Confirma la conciliación (automática o con desempate de candidato elegido por el usuario).
     1. Guarda en tabla vouchers con estado CONCILIADO.
     2. Bloquea el depósito como USADO.
     3. Sincroniza con Google Sheets (🟢 SÍ).
     """
-    es_ant = 1 if payload.fecha_comprobante < datetime.now().strftime("%Y-%m-%d") else 0
+    es_ant = 1 if payload.fecha_comprobante < db.hoy_negocio() else 0
     
     # Crear registro voucher
     voucher_data = {
+        "id": payload.id,
         "grupo_whatsapp_id": payload.grupo_whatsapp_id,
         "grupo_whatsapp_nombre": payload.grupo_whatsapp_nombre,
         "monto": payload.monto,
@@ -233,26 +346,26 @@ def confirmar_voucher(payload: VoucherConfirmacion):
         "es_fecha_anterior": es_ant,
         "imagen_path": payload.imagen_path,
         "observaciones": payload.observaciones,
-        "fecha_conciliacion": datetime.now().isoformat()
+        "fecha_conciliacion": db.ahora_negocio().isoformat()
     }
 
-    if payload.id:
-        vid = payload.id
-        db.actualizar_voucher_estado(vid, "CONCILIADO", payload.deposito_asociado_id, payload.observaciones)
-    else:
-        vid = db.crear_voucher(voucher_data)
-
-    # Actualizar estado de conciliación y bloquear depósito
-    reconciler.confirmar_conciliacion_reconciler(
-        voucher_id=vid,
-        deposito_id=payload.deposito_asociado_id,
-        modo=payload.modo or "AUTOMATICO",
-        observaciones=payload.observaciones or ""
-    )
+    try:
+        vid = db.crear_y_conciliar_voucher(
+            voucher_data,
+            payload.deposito_asociado_id,
+            payload.modo or "AUTOMATICO",
+            payload.observaciones or "",
+            usuario=user["nombre"]
+        )
+    except db.DepositoNoDisponible:
+        raise HTTPException(
+            status_code=409,
+            detail="Ese depósito ya fue usado por otra operación; vuelve a verificar el cruce"
+        )
 
     # Sincronizar con Google Sheets
     voucher_data["id"] = vid
-    sheets_res = sheets_sync.sincronizar_voucher_sheets(voucher_data, estado_display="🟢 SÍ")
+    sheets_res = _sincronizar_y_marcar_sheets(voucher_data, estado_display="🟢 SÍ")
 
     return {
         "success": True,
@@ -263,15 +376,19 @@ def confirmar_voucher(payload: VoucherConfirmacion):
 
 
 @app.post("/api/vouchers/forzar-si")
-def forzar_si_voucher(payload: VoucherConfirmacion):
+def forzar_si_voucher(
+    payload: VoucherConfirmacion,
+    user: Dict[str, Any] = Depends(requerir_roles("dueno", "supervisor"))
+):
     """
     BOTÓN DE EMERGENCIA: Permite al usuario aprobar manualmente un voucher
     incluso si aún no aparece en el extracto o si falló la API.
     """
-    es_ant = 1 if payload.fecha_comprobante < datetime.now().strftime("%Y-%m-%d") else 0
+    es_ant = 1 if payload.fecha_comprobante < db.hoy_negocio() else 0
     obs = (payload.observaciones or "") + " [FORZADO MANUAL POR USUARIO]"
 
     voucher_data = {
+        "id": payload.id,
         "grupo_whatsapp_id": payload.grupo_whatsapp_id,
         "grupo_whatsapp_nombre": payload.grupo_whatsapp_nombre,
         "monto": payload.monto,
@@ -290,24 +407,19 @@ def forzar_si_voucher(payload: VoucherConfirmacion):
         "es_fecha_anterior": es_ant,
         "imagen_path": payload.imagen_path,
         "observaciones": obs,
-        "fecha_conciliacion": datetime.now().isoformat()
+        "fecha_conciliacion": db.ahora_negocio().isoformat()
     }
 
-    if payload.id:
-        vid = payload.id
-        db.actualizar_voucher_estado(vid, "FORZADO_MANUAL", None, obs)
-    else:
-        vid = db.crear_voucher(voucher_data)
-
-    reconciler.confirmar_conciliacion_reconciler(
-        voucher_id=vid,
-        deposito_id=None,
-        modo="FORZADO",
-        observaciones=obs
+    vid = db.crear_y_conciliar_voucher(
+        voucher_data,
+        None,
+        "FORZADO",
+        obs,
+        usuario=user["nombre"]
     )
 
     voucher_data["id"] = vid
-    sheets_res = sheets_sync.sincronizar_voucher_sheets(voucher_data, estado_display="🟢 SÍ (MANUAL)")
+    sheets_res = _sincronizar_y_marcar_sheets(voucher_data, estado_display="🟢 SÍ (MANUAL)")
 
     return {
         "success": True,
@@ -318,7 +430,10 @@ def forzar_si_voucher(payload: VoucherConfirmacion):
 
 
 @app.post("/api/vouchers/en-espera")
-def guardar_en_espera(payload: VoucherEnEspera):
+def guardar_en_espera(
+    payload: VoucherEnEspera,
+    user: Dict[str, Any] = Depends(usuario_actual)
+):
     """
     Guarda el voucher en la pestaña de Pendientes / En Espera (Rojo).
     Registra también en Google Sheets como 🔴 EN ESPERA.
@@ -345,10 +460,15 @@ def guardar_en_espera(payload: VoucherEnEspera):
     else:
         vid = db.crear_voucher(voucher_data)
 
-    db.registrar_auditoria(vid, "EN_ESPERA", f"Dejado en espera para monto R$ {payload.monto}")
+    db.registrar_auditoria(
+        vid,
+        "EN_ESPERA",
+        f"Dejado en espera para monto R$ {payload.monto}",
+        usuario=user["nombre"]
+    )
 
     voucher_data["id"] = vid
-    sheets_res = sheets_sync.sincronizar_voucher_sheets(voucher_data, estado_display="🔴 EN ESPERA")
+    sheets_res = _sincronizar_y_marcar_sheets(voucher_data, estado_display="🔴 EN ESPERA")
 
     return {
         "success": True,
@@ -359,13 +479,25 @@ def guardar_en_espera(payload: VoucherEnEspera):
 
 
 @app.get("/api/vouchers/pendientes")
-def obtener_pendientes():
+def obtener_pendientes(user: Dict[str, Any] = Depends(usuario_actual)):
     return db.get_vouchers_pendientes()
 
 
 @app.get("/api/vouchers/historial")
-def obtener_historial(limite: int = 150):
+def obtener_historial(limite: int = 150, user: Dict[str, Any] = Depends(usuario_actual)):
     return db.get_vouchers_historial(limite)
+
+
+@app.get("/api/vouchers/imagen")
+def obtener_imagen_voucher(path: str, user: Dict[str, Any] = Depends(usuario_actual)):
+    """Devuelve la imagen o PDF de un voucher guardado verificando estrictamente la ruta."""
+    storage_root = STORAGE_HISTORIAL.resolve()
+    ruta = (BASE_DIR / path).resolve()
+    if ruta == storage_root or not ruta.is_relative_to(storage_root):
+        raise HTTPException(status_code=403, detail="Ruta no permitida")
+    if not ruta.exists() or not ruta.is_file():
+        raise HTTPException(status_code=404, detail="Imagen no encontrada")
+    return FileResponse(ruta)
 
 
 # ----------------------------------------------------
@@ -374,7 +506,8 @@ def obtener_historial(limite: int = 150):
 @app.post("/api/extractos/upload")
 async def upload_extracto_archivo(
     archivo: UploadFile = File(...),
-    banco: Optional[str] = Form("Itaú Unibanco")
+    banco: Optional[str] = Form("Itaú Unibanco"),
+    user: Dict[str, Any] = Depends(usuario_actual)
 ):
     """
     Vía B (o manual):
@@ -382,57 +515,41 @@ async def upload_extracto_archivo(
     o archivos .OFX / .CSV. La IA o el parser extraen todos los depósitos a la base de datos local.
     """
     contenido = await archivo.read()
-    nombre_archivo = archivo.filename or "extracto.jpg"
+    if len(contenido) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Archivo demasiado grande (máximo 10 MB)")
+    nombre_archivo = Path(archivo.filename or "extracto.jpg").name
     ext = Path(nombre_archivo).suffix.lower()
-    
+
+    if ext not in EXTENSIONES_IMAGEN_PDF and ext not in (".csv", ".ofx"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato de archivo no soportado: {ext or 'sin extensión'}. Usa imagen, PDF, CSV u OFX."
+        )
+
     dir_destino = get_directorio_hoy("extractos")
-    timestamp = datetime.now().strftime("%H%M%S")
+    timestamp = db.ahora_negocio().strftime("%H%M%S")
     ruta_guardado = dir_destino / f"ext_{timestamp}_{nombre_archivo}"
     with open(ruta_guardado, "wb") as f:
         f.write(contenido)
 
     depositos_extraidos: List[Dict[str, Any]] = []
 
-    if ext in [".jpg", ".jpeg", ".png", ".webp", ".pdf"]:
+    if ext in EXTENSIONES_IMAGEN_PDF:
         mime = "application/pdf" if ext == ".pdf" else "image/jpeg"
         try:
             depositos_extraidos = ai_vision.extraer_datos_extracto(contenido, mime, banco or "Banco")
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
     elif ext == ".csv":
-        # Parseo simple de CSV bancario
-        lineas = contenido.decode("utf-8", errors="ignore").splitlines()
-        hoy = datetime.now().strftime("%Y-%m-%d")
-        for linea in lineas[1:]:
-            partes = linea.split(";") if ";" in linea else linea.split(",")
-            if len(partes) >= 3:
-                try:
-                    m = float(partes[2].replace("R$", "").replace(".", "").replace(",", ".").strip())
-                    if m > 0:
-                        depositos_extraidos.append({
-                            "banco": banco or "Banco",
-                            "fecha": partes[0].strip() or hoy,
-                            "hora": None,
-                            "monto": m,
-                            "descripcion": partes[1].strip(),
-                            "id_transaccion_pix": None,
-                            "tipo": "PIX_IN",
-                            "origen_extracto": "CSV"
-                        })
-                except Exception:
-                    continue
-    else:
-        # Formato no soportado directamente, intentar con IA
-        try:
-            depositos_extraidos = ai_vision.extraer_datos_extracto(contenido, "image/jpeg", banco or "Banco")
-        except RuntimeError as e:
-            raise HTTPException(status_code=502, detail=str(e))
+        depositos_extraidos = parsers.parse_csv(contenido, banco or "Banco")
+    elif ext == ".ofx":
+        depositos_extraidos = parsers.parse_ofx(contenido, banco or "Banco")
 
     for d in depositos_extraidos:
         d["archivo_fuente"] = str(ruta_guardado.relative_to(BASE_DIR))
 
     insertados = db.guardar_depositos_extracto(depositos_extraidos)
-    recruce = reconciler.recruzar_pendientes_automatico()
+    recruce = reconciler.recruzar_pendientes_automatico(usuario=user["nombre"])
 
     return {
         "success": True,
@@ -445,7 +562,10 @@ async def upload_extracto_archivo(
 
 
 @app.post("/api/extractos/import-json")
-def import_extracto_json(payload: ExtractoImportJSON):
+def import_extracto_json(
+    payload: ExtractoImportJSON,
+    user: Dict[str, Any] = Depends(usuario_actual)
+):
     """
     Vía A (Extensión de Chrome):
     Recibe directamente las líneas scrapeadas de la pestaña bancaria abierta en la PC del usuario.
@@ -453,11 +573,13 @@ def import_extracto_json(payload: ExtractoImportJSON):
     depositos_list = []
     for dep in payload.depositos:
         d = dep.model_dump()
+        if not d.get("banco"):
+            d["banco"] = payload.banco
         d["origen_extracto"] = "CHROME_EXTENSION"
         depositos_list.append(d)
 
     insertados = db.guardar_depositos_extracto(depositos_list)
-    recruce = reconciler.recruzar_pendientes_automatico()
+    recruce = reconciler.recruzar_pendientes_automatico(usuario=user["nombre"])
 
     return {
         "success": True,
@@ -469,7 +591,10 @@ def import_extracto_json(payload: ExtractoImportJSON):
 
 
 @app.get("/api/extractos/libres")
-def listar_extractos_libres(fecha: Optional[str] = None):
+def listar_extractos_libres(
+    fecha: Optional[str] = None,
+    user: Dict[str, Any] = Depends(usuario_actual)
+):
     """Devuelve los depósitos aún disponibles en el 'Bolsón de Depósitos Libres'."""
     return db.get_depositos_libres(fecha)
 
@@ -478,29 +603,57 @@ def listar_extractos_libres(fecha: Optional[str] = None):
 # ENDPOINTS: ANULACIÓN, RECRUCE Y CIERRE DE CAJA
 # ----------------------------------------------------
 @app.post("/api/vouchers/{voucher_id}/anular")
-def anular_voucher_endpoint(voucher_id: int, payload: Optional[AnularVoucherRequest] = None):
+def anular_voucher_endpoint(
+    voucher_id: int,
+    payload: Optional[AnularVoucherRequest] = None,
+    user: Dict[str, Any] = Depends(requerir_roles("dueno", "supervisor"))
+):
     motivo = payload.motivo if payload else "Corrección manual"
-    res = db.anular_voucher(voucher_id, motivo)
+    res = db.anular_voucher(voucher_id, motivo, usuario=user["nombre"])
     if not res["success"]:
         raise HTTPException(status_code=404, detail=res.get("error", "Voucher no encontrado"))
-    sheets_sync.sincronizar_voucher_sheets(res["voucher"], estado_display="⚪ ANULADO")
+    _sincronizar_y_marcar_sheets(res["voucher"], estado_display="⚪ ANULADO")
     return res
 
 
 @app.post("/api/vouchers/recruzar-pendientes")
-def recruzar_pendientes_endpoint():
-    return reconciler.recruzar_pendientes_automatico()
+def recruzar_pendientes_endpoint(user: Dict[str, Any] = Depends(usuario_actual)):
+    return reconciler.recruzar_pendientes_automatico(usuario=user["nombre"])
+
+
+@app.post("/api/sheets/reintentar")
+def reintentar_sync_sheets(user: Dict[str, Any] = Depends(usuario_actual)):
+    """Reintenta sincronizar con Google Sheets los vouchers con sheets_synced = 0."""
+    pendientes_sync = db.get_vouchers_sin_sync_sheets()
+    sincronizados = 0
+    for v in pendientes_sync:
+        estado_display = _estado_display_sheets(v.get("estado", ""))
+        sheets_res = _sincronizar_y_marcar_sheets(v, estado_display=estado_display)
+        if sheets_res.get("success") and not sheets_res.get("simulado"):
+            sincronizados += 1
+    intentados = len(pendientes_sync)
+    return {
+        "intentados": intentados,
+        "sincronizados": sincronizados,
+        "pendientes": intentados - sincronizados,
+    }
 
 
 @app.get("/api/cierre-caja")
-def obtener_cierre_caja(fecha: Optional[str] = None):
-    fecha_obj = fecha or datetime.now().strftime("%Y-%m-%d")
+def obtener_cierre_caja(
+    fecha: Optional[str] = None,
+    user: Dict[str, Any] = Depends(usuario_actual)
+):
+    fecha_obj = fecha or db.hoy_negocio()
     return db.get_resumen_cierre_dia(fecha_obj)
 
 
 @app.post("/api/cierre-caja/cerrar")
-def cerrar_caja_dia(payload: CierreCajaRequest):
-    fecha_obj = payload.fecha or datetime.now().strftime("%Y-%m-%d")
+def cerrar_caja_dia(
+    payload: CierreCajaRequest,
+    user: Dict[str, Any] = Depends(requerir_roles("dueno", "supervisor"))
+):
+    fecha_obj = payload.fecha or db.hoy_negocio()
     resumen = db.guardar_cierre_caja(
         fecha=fecha_obj,
         saldo_inicial_brl=payload.saldo_inicial_brl,
@@ -508,12 +661,19 @@ def cerrar_caja_dia(payload: CierreCajaRequest):
         saldo_final_real_brl=payload.saldo_final_real_brl,
         observaciones=payload.observaciones or ""
     )
+    try:
+        backup.respaldar()
+    except Exception as e:
+        print(f"[BACKUP] No se pudo respaldar al cerrar caja: {e}")
     sheets_res = sheets_sync.sincronizar_cierre_sheets(resumen)
     return {"success": True, "cierre": resumen, "sheets_result": sheets_res}
 
 
 @app.get("/api/cierre-caja/historial")
-def obtener_historial_cierres(limite: int = 30):
+def obtener_historial_cierres(
+    limite: int = 30,
+    user: Dict[str, Any] = Depends(usuario_actual)
+):
     return db.get_historial_cierres(limite)
 
 
@@ -521,8 +681,8 @@ def obtener_historial_cierres(limite: int = 30):
 # ENDPOINTS: DASHBOARD Y MÉTRICAS
 # ----------------------------------------------------
 @app.get("/api/stats")
-def obtener_estadisticas():
-    hoy = datetime.now().strftime("%Y-%m-%d")
+def obtener_estadisticas(user: Dict[str, Any] = Depends(usuario_actual)):
+    hoy = db.hoy_negocio()
     return db.get_estadisticas_hoy(hoy)
 
 
@@ -545,4 +705,4 @@ if __name__ == "__main__":
     puerto = int(os.getenv("PORT", 8000))
     host = os.getenv("HOST", "0.0.0.0")
     print(f"Iniciando Sistema de Remesas en http://{host}:{puerto}")
-    uvicorn.run("main:app", host=host, port=puerto, reload=True)
+    uvicorn.run("main:app", host=host, port=puerto, reload=os.getenv("DEBUG") == "1")

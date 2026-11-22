@@ -1,20 +1,69 @@
-import sqlite3
+import hashlib
+import hmac
 import os
+import secrets
+import sqlite3
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 DB_FILE = os.getenv("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "remesas.db"))
 
+
+def ahora_negocio() -> datetime:
+    """Retorna la fecha/hora actual en la zona horaria de negocio (default America/La_Paz)."""
+    tz_name = os.getenv("TIMEZONE", "America/La_Paz")
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            pass
+    return datetime.now()
+
+
+def hoy_negocio() -> str:
+    """Retorna la fecha actual de negocio en formato YYYY-MM-DD."""
+    return ahora_negocio().strftime("%Y-%m-%d")
+
+
+class DepositoNoDisponible(Exception):
+    """Se lanza cuando el depósito ya fue usado por otra operación concurrente."""
+    pass
+
+
+def _get_db_file() -> str:
+    return os.getenv("DATABASE_PATH") or DB_FILE
+
+
 def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(_get_db_file(), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
     return conn
+
+
+def hash_pin(pin: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt.encode("utf-8"), 200000).hex()
+    return f"{salt}${digest}"
+
+
+def verificar_pin(pin: str, pin_hash: str) -> bool:
+    if not pin_hash or "$" not in pin_hash:
+        return False
+    salt, esperado = pin_hash.split("$", 1)
+    actual = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt.encode("utf-8"), 200000).hex()
+    return hmac.compare_digest(actual, esperado)
+
 
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode = WAL;")
 
     # 1. Tabla de Grupos de WhatsApp
     cursor.execute("""
@@ -125,6 +174,37 @@ def init_db():
     );
     """)
 
+    # 6. Tabla de Usuarios y Sesiones
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS usuarios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT NOT NULL UNIQUE,
+        pin_hash TEXT NOT NULL,
+        rol TEXT DEFAULT 'operador',
+        activo INTEGER DEFAULT 1
+    );
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sesiones (
+        token TEXT PRIMARY KEY,
+        usuario_id INTEGER NOT NULL,
+        creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (usuario_id) REFERENCES usuarios (id) ON DELETE CASCADE
+    );
+    """)
+
+    cursor.execute("SELECT COUNT(*) FROM usuarios;")
+    if cursor.fetchone()[0] == 0:
+        admin_pin = os.getenv("ADMIN_PIN")
+        if not admin_pin:
+            admin_pin = "1234"
+            print("[SEGURIDAD] Cambia el PIN de admin")
+        cursor.execute(
+            "INSERT INTO usuarios (nombre, pin_hash, rol, activo) VALUES (?, ?, 'dueno', 1);",
+            ("admin", hash_pin(admin_pin))
+        )
+
     # Insertar grupos por defecto si no existen
     cursor.execute("SELECT COUNT(*) FROM grupos_whatsapp;")
     if cursor.fetchone()[0] == 0:
@@ -170,42 +250,123 @@ def crear_grupo(nombre: str, color: str = "#10B981") -> int:
     conn.close()
     return gid
 
+# Usuarios y Sesiones
+def autenticar_usuario(nombre: str, pin: str) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM usuarios WHERE nombre = ? AND activo = 1;", (nombre.strip(),))
+        row = cursor.fetchone()
+        if not row or not verificar_pin(pin, row["pin_hash"]):
+            return None
+        token = secrets.token_urlsafe(32)
+        cursor.execute("INSERT INTO sesiones (token, usuario_id) VALUES (?, ?);", (token, row["id"]))
+        conn.commit()
+        return {"token": token, "nombre": row["nombre"], "rol": row["rol"]}
+    finally:
+        conn.close()
+
+
+def get_usuario_por_token(token: str) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT u.id, u.nombre, u.rol
+            FROM sesiones s
+            JOIN usuarios u ON s.usuario_id = u.id
+            WHERE s.token = ? AND u.activo = 1;
+        """, (token,))
+        row = cursor.fetchone()
+        return row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def crear_usuario(nombre: str, pin: str, rol: str = "operador") -> Dict[str, Any]:
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO usuarios (nombre, pin_hash, rol, activo) VALUES (?, ?, ?, 1);",
+            (nombre.strip(), hash_pin(pin), rol),
+        )
+        uid = cursor.lastrowid
+        conn.commit()
+        return {"id": uid, "nombre": nombre.strip(), "rol": rol}
+    finally:
+        conn.close()
+
+
 # Depósitos de extracto
 def guardar_depositos_extracto(depositos: List[Dict[str, Any]]) -> int:
-    """Guarda múltiples líneas de depósitos bancarios asegurando que no se dupliquen registros idénticos."""
+    """Guarda múltiples líneas de depósitos bancarios con dedupe seguro (prioriza no perder depósitos)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     insertados = 0
     for dep in depositos:
-        # Prevenir duplicar la misma línea si ya existe exactamente igual
-        cursor.execute("""
-            SELECT id FROM depositos_extracto 
-            WHERE banco = ? AND fecha = ? AND monto = ? AND descripcion = ? 
-            AND (hora = ? OR hora IS NULL OR ? IS NULL)
-        """, (
-            dep.get("banco", "Banco"),
-            dep.get("fecha"),
-            float(dep.get("monto", 0.0)),
-            dep.get("descripcion", ""),
-            dep.get("hora"),
-            dep.get("hora")
-        ))
-        existente = cursor.fetchone()
-        if not existente:
+        banco = (dep.get("banco") or "Banco").strip() or "Banco"
+        fecha = dep.get("fecha")
+        hora_raw = dep.get("hora")
+        hora = str(hora_raw).strip() if hora_raw is not None else ""
+        hora_db = hora if hora else None
+        monto = float(dep.get("monto", 0.0))
+        desc = (dep.get("descripcion") or "").strip()
+        pix_raw = dep.get("id_transaccion_pix")
+        pix_id = str(pix_raw).strip() if pix_raw is not None else ""
+        pix_db = pix_id if pix_id else None
+
+        debe_insertar = False
+        desc_final = desc
+
+        if pix_db:
+            cursor.execute(
+                "SELECT id FROM depositos_extracto WHERE id_transaccion_pix = ?;",
+                (pix_db,),
+            )
+            if not cursor.fetchone():
+                debe_insertar = True
+        elif hora and desc:
+            cursor.execute(
+                """
+                SELECT id FROM depositos_extracto
+                WHERE banco = ? AND fecha = ? AND monto = ? AND descripcion = ? AND hora = ?;
+                """,
+                (banco, fecha, monto, desc, hora),
+            )
+            if not cursor.fetchone():
+                debe_insertar = True
+        else:
+            # Si hora o descripción están vacías, insertar siempre y advertir si ya existía uno igual
+            debe_insertar = True
+            desc_marcada = f"{desc} (revisar posible duplicado)".strip()
+            cursor.execute(
+                """
+                SELECT id FROM depositos_extracto
+                WHERE banco = ? AND fecha = ? AND monto = ?
+                  AND COALESCE(hora, '') = ?
+                  AND COALESCE(descripcion, '') IN (?, ?);
+                """,
+                (banco, fecha, monto, hora, desc, desc_marcada),
+            )
+            if cursor.fetchone():
+                desc_final = desc_marcada
+
+        if debe_insertar:
             cursor.execute("""
                 INSERT INTO depositos_extracto (
                     banco, cuenta, fecha, hora, monto, tipo, descripcion, 
                     id_transaccion_pix, origen_extracto, estado, archivo_fuente
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIBRE', ?);
             """, (
-                dep.get("banco", "Banco"),
+                banco,
                 dep.get("cuenta"),
-                dep.get("fecha"),
-                dep.get("hora"),
-                float(dep.get("monto", 0.0)),
+                fecha,
+                hora_db,
+                monto,
                 dep.get("tipo", "PIX_IN"),
-                dep.get("descripcion", ""),
-                dep.get("id_transaccion_pix"),
+                desc_final,
+                pix_db,
                 dep.get("origen_extracto", "DESCONOCIDO"),
                 dep.get("archivo_fuente")
             ))
@@ -283,22 +444,129 @@ def crear_voucher(data: Dict[str, Any]) -> int:
 
 def actualizar_voucher_estado(voucher_id: int, estado: str, deposito_id: Optional[int] = None, observaciones: Optional[str] = None):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    now = datetime.now().isoformat()
-    cursor.execute("""
-        UPDATE vouchers 
-        SET estado = ?, 
-            deposito_asociado_id = COALESCE(?, deposito_asociado_id),
-            fecha_conciliacion = CASE WHEN ? IN ('CONCILIADO', 'FORZADO_MANUAL') THEN ? ELSE fecha_conciliacion END,
-            observaciones = COALESCE(?, observaciones)
-        WHERE id = ?;
-    """, (estado, deposito_id, estado, now, observaciones, voucher_id))
-    
-    if deposito_id and estado in ('CONCILIADO', 'FORZADO_MANUAL'):
-        cursor.execute("UPDATE depositos_extracto SET estado = 'USADO', voucher_id = ? WHERE id = ?;", (voucher_id, deposito_id))
+    try:
+        cursor = conn.cursor()
+        now = ahora_negocio().isoformat()
+        cursor.execute("""
+            UPDATE vouchers 
+            SET estado = ?, 
+                deposito_asociado_id = COALESCE(?, deposito_asociado_id),
+                fecha_conciliacion = CASE WHEN ? IN ('CONCILIADO', 'FORZADO_MANUAL') THEN ? ELSE fecha_conciliacion END,
+                observaciones = COALESCE(?, observaciones)
+            WHERE id = ?;
+        """, (estado, deposito_id, estado, now, observaciones, voucher_id))
 
-    conn.commit()
-    conn.close()
+        if deposito_id and estado in ('CONCILIADO', 'FORZADO_MANUAL'):
+            cursor.execute(
+                "UPDATE depositos_extracto SET estado = 'USADO', voucher_id = ? WHERE id = ? AND (estado = 'LIBRE' OR voucher_id = ?);",
+                (voucher_id, deposito_id, voucher_id),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise DepositoNoDisponible("Ese depósito ya fue usado por otra operación; vuelve a verificar el cruce")
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def crear_y_conciliar_voucher(
+    data: Dict[str, Any],
+    deposito_id: Optional[int],
+    modo: str = "AUTOMATICO",
+    observaciones: str = "",
+    usuario: str = "Back-office",
+) -> int:
+    """Inserta o actualiza un voucher, bloquea el depósito (si aplica) y registra auditoría en una transacción única."""
+    estado_final = "FORZADO_MANUAL" if modo == "FORZADO" else "CONCILIADO"
+    now = ahora_negocio().isoformat()
+    obs_str = observaciones if observaciones is not None else (data.get("observaciones") or "")
+
+    if modo == "DESEMPATE":
+        accion_audit = "DESEMPATE_MANUAL"
+    elif modo == "FORZADO":
+        accion_audit = "FORZADO_MANUAL"
+    elif modo == "AUTO_RECRUCE":
+        accion_audit = "AUTO_RECRUCE"
+    else:
+        accion_audit = "MATCH_AUTOMATICO"
+
+    conn = get_db_connection()
+    conn.isolation_level = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE;")
+
+        voucher_id = data.get("id")
+        if voucher_id:
+            voucher_id = int(voucher_id)
+            cursor.execute("""
+                UPDATE vouchers
+                SET estado = ?,
+                    deposito_asociado_id = ?,
+                    fecha_conciliacion = ?,
+                    observaciones = CASE WHEN ? != '' THEN ? ELSE observaciones END
+                WHERE id = ?;
+            """, (estado_final, deposito_id, now, obs_str, obs_str, voucher_id))
+            if cursor.rowcount != 1:
+                raise ValueError(f"Voucher #{voucher_id} no encontrado")
+        else:
+            cursor.execute("""
+                INSERT INTO vouchers (
+                    grupo_whatsapp_id, grupo_whatsapp_nombre, monto, fecha_comprobante,
+                    hora_comprobante, pagador_nombre, pagador_documento, receptor_nombre,
+                    receptor_documento, banco_origen, banco_destino, id_transaccion_pix,
+                    tipo_operacion, estado, deposito_asociado_id, es_fecha_anterior,
+                    imagen_path, datos_ia_raw, observaciones, fecha_conciliacion, sheets_synced
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                data.get("grupo_whatsapp_id"),
+                data.get("grupo_whatsapp_nombre", "General"),
+                float(data.get("monto", 0.0)),
+                data.get("fecha_comprobante"),
+                data.get("hora_comprobante"),
+                data.get("pagador_nombre"),
+                data.get("pagador_documento"),
+                data.get("receptor_nombre"),
+                data.get("receptor_documento"),
+                data.get("banco_origen"),
+                data.get("banco_destino"),
+                data.get("id_transaccion_pix"),
+                data.get("tipo_operacion", "PIX"),
+                estado_final,
+                deposito_id,
+                data.get("es_fecha_anterior", 0),
+                data.get("imagen_path"),
+                data.get("datos_ia_raw"),
+                obs_str,
+                data.get("fecha_conciliacion") or now,
+                data.get("sheets_synced", 0),
+            ))
+            voucher_id = cursor.lastrowid
+
+        if deposito_id:
+            cursor.execute(
+                "UPDATE depositos_extracto SET estado = 'USADO', voucher_id = ? WHERE id = ? AND (estado = 'LIBRE' OR voucher_id = ?);",
+                (voucher_id, deposito_id, voucher_id),
+            )
+            if cursor.rowcount != 1:
+                raise DepositoNoDisponible("Ese depósito ya fue usado por otra operación; vuelve a verificar el cruce")
+
+        cursor.execute("""
+            INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles, usuario)
+            VALUES (?, ?, ?, ?, ?);
+        """, (voucher_id, deposito_id, accion_audit, f"Modo: {modo}. {obs_str}", usuario or "Back-office"))
+
+        conn.commit()
+        return voucher_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def get_voucher_por_id(voucher_id: int) -> Optional[Dict[str, Any]]:
     conn = get_db_connection()
@@ -336,13 +604,45 @@ def get_vouchers_historial(limite: int = 150) -> List[Dict[str, Any]]:
     conn.close()
     return res
 
-def registrar_auditoria(voucher_id: int, accion: str, detalles: str, deposito_id: Optional[int] = None):
+def marcar_sheets_sync(voucher_id: int, synced: bool, error: Optional[str] = None):
+    """Actualiza el estado de sincronización con Google Sheets para un voucher."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE vouchers
+            SET sheets_synced = ?,
+                sheets_sync_error = ?
+            WHERE id = ?;
+            """,
+            (1 if synced else 0, None if synced else error, voucher_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_vouchers_sin_sync_sheets() -> List[Dict[str, Any]]:
+    """Devuelve los vouchers pendientes de sincronización real con Google Sheets."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM vouchers
+            WHERE COALESCE(sheets_synced, 0) = 0
+            ORDER BY id ASC;
+        """)
+        return rows_to_list(cursor.fetchall())
+    finally:
+        conn.close()
+
+def registrar_auditoria(voucher_id: int, accion: str, detalles: str, deposito_id: Optional[int] = None, usuario: str = "Back-office"):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles)
-        VALUES (?, ?, ?, ?);
-    """, (voucher_id, deposito_id, accion, detalles))
+        INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles, usuario)
+        VALUES (?, ?, ?, ?, ?);
+    """, (voucher_id, deposito_id, accion, detalles, usuario or "Back-office"))
     conn.commit()
     conn.close()
 
@@ -397,7 +697,7 @@ def get_estadisticas_hoy(fecha_hoy: str) -> Dict[str, Any]:
         "libres_total_monto": round(row_dep_total[1], 2),
     }
 
-def anular_voucher(voucher_id: int, motivo: str = "") -> Dict[str, Any]:
+def anular_voucher(voucher_id: int, motivo: str = "", usuario: str = "Back-office") -> Dict[str, Any]:
     """Anula un voucher y libera su depósito asociado (si tenía uno) para corregir errores."""
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -432,9 +732,9 @@ def anular_voucher(voucher_id: int, motivo: str = "") -> Dict[str, Any]:
         deposito_liberado = True
 
     cursor.execute("""
-        INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles)
-        VALUES (?, ?, 'ANULADO', ?);
-    """, (voucher_id, dep_id, motivo or "Anulado manualmente"))
+        INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles, usuario)
+        VALUES (?, ?, 'ANULADO', ?, ?);
+    """, (voucher_id, dep_id, motivo or "Anulado manualmente", usuario or "Back-office"))
 
     conn.commit()
     conn.close()
@@ -653,7 +953,7 @@ def guardar_cierre_caja(
     saldo_teorico = round(saldo_inicial_brl + tot["depositos_dia_monto"] - salidas_brl, 2)
     diferencia = round(saldo_final_real_brl - saldo_teorico, 2) if saldo_final_real_brl is not None else 0.0
 
-    now = datetime.now().isoformat()
+    now = ahora_negocio().isoformat()
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""

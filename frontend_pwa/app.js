@@ -2,9 +2,9 @@
 // LÓGICA PRINCIPAL FRONTEND PWA - REMESAS BRASIL ⇄ BOLIVIA
 // ========================================================
 
-const API_BASE = window.location.origin.includes("localhost") || window.location.origin.includes("127.0.0.1") || window.location.origin.includes("192.168")
-  ? window.location.origin
-  : "http://localhost:8000";
+const API_BASE = (window.location.protocol === "file:" || !window.location.origin || window.location.origin === "null")
+  ? "http://localhost:8000"
+  : window.location.origin;
 
 // Estado global de la aplicación
 const AppState = {
@@ -20,18 +20,178 @@ const AppState = {
 };
 
 // ========================================================
-// INICIALIZACIÓN Y SERVICE WORKER
+// AUTENTICACIÓN Y API FETCH
 // ========================================================
-document.addEventListener("DOMContentLoaded", () => {
-  initServiceWorker();
-  initTabs();
+function mostrarLogin() {
+  const loginScreen = document.getElementById("login-screen");
+  const userInfo = document.getElementById("header-user-info");
+  const userNameEl = document.getElementById("header-user-name");
+  const pinInput = document.getElementById("login-pin");
+  const errEl = document.getElementById("login-error");
+
+  if (loginScreen) {
+    loginScreen.classList.remove("hidden");
+    loginScreen.classList.add("flex");
+  }
+  if (userInfo) {
+    userInfo.classList.add("hidden");
+    userInfo.classList.remove("flex");
+  }
+  if (userNameEl) userNameEl.textContent = "";
+  if (pinInput) pinInput.value = "";
+  if (errEl) {
+    errEl.textContent = "";
+    errEl.classList.add("hidden");
+  }
+}
+
+function ocultarLogin(user) {
+  const loginScreen = document.getElementById("login-screen");
+  const userInfo = document.getElementById("header-user-info");
+  const userNameEl = document.getElementById("header-user-name");
+  const errEl = document.getElementById("login-error");
+
+  if (loginScreen) {
+    loginScreen.classList.add("hidden");
+    loginScreen.classList.remove("flex");
+  }
+  if (errEl) {
+    errEl.textContent = "";
+    errEl.classList.add("hidden");
+  }
+
+  let userData = user;
+  if (!userData) {
+    try {
+      userData = JSON.parse(localStorage.getItem("remesas_user") || "null");
+    } catch (_) {
+      userData = null;
+    }
+  }
+  if (userInfo && userData) {
+    if (userNameEl) userNameEl.textContent = userData.nombre || userData.username || "";
+    userInfo.classList.remove("hidden");
+    userInfo.classList.add("flex");
+  }
+}
+
+async function apiFetch(url, opts = {}) {
+  const token = localStorage.getItem("remesas_token");
+  const headers = new Headers(opts.headers || {});
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const res = await fetch(url, { ...opts, headers });
+  if (res.status === 401) {
+    localStorage.removeItem("remesas_token");
+    localStorage.removeItem("remesas_user");
+    mostrarLogin();
+    throw new Error("Sesión expirada. Inicia sesión nuevamente.");
+  }
+  return res;
+}
+
+function cargarDatosIniciales() {
   cargarGruposWhatsApp();
-  initVoucherUpload();
-  initActionButtons();
-  initCierreCaja();
   cargarEstadisticas();
   cargarPendientes();
   cargarDepositosLibres();
+}
+
+function initAuth() {
+  const loginForm = document.getElementById("login-form");
+  const errEl = document.getElementById("login-error");
+  const btnLogout = document.getElementById("btn-logout");
+
+  if (loginForm) {
+    loginForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const nombre = document.getElementById("login-nombre").value.trim();
+      const pin = document.getElementById("login-pin").value.trim();
+      const submitBtn = document.getElementById("btn-login-submit");
+
+      if (errEl) {
+        errEl.textContent = "";
+        errEl.classList.add("hidden");
+      }
+      if (submitBtn) submitBtn.disabled = true;
+
+      try {
+        const res = await fetch(`${API_BASE}/api/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ nombre, pin })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || "Usuario o PIN incorrecto");
+        }
+
+        const token = data.token || data.access_token;
+        if (!token) {
+          throw new Error("El servidor no devolvió un token válido");
+        }
+        const user = data.usuario || data.user || { nombre };
+
+        localStorage.setItem("remesas_token", token);
+        localStorage.setItem("remesas_user", JSON.stringify(user));
+
+        ocultarLogin(user);
+        cargarDatosIniciales();
+        showToast(`Bienvenido, ${user.nombre || nombre}`, "success");
+      } catch (err) {
+        if (errEl) {
+          errEl.textContent = err.message;
+          errEl.classList.remove("hidden");
+        }
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+
+  if (btnLogout) {
+    btnLogout.addEventListener("click", () => {
+      localStorage.removeItem("remesas_token");
+      localStorage.removeItem("remesas_user");
+      mostrarLogin();
+      showToast("Sesión cerrada", "info");
+    });
+  }
+}
+
+// ========================================================
+// INICIALIZACIÓN Y SERVICE WORKER
+// ========================================================
+document.addEventListener("DOMContentLoaded", async () => {
+  initServiceWorker();
+  initTabs();
+  initVoucherUpload();
+  initActionButtons();
+  initCierreCaja();
+  initAuth();
+
+  const token = localStorage.getItem("remesas_token");
+  if (!token) {
+    mostrarLogin();
+    return;
+  }
+
+  try {
+    const res = await apiFetch(`${API_BASE}/api/auth/yo`);
+    if (!res.ok) {
+      throw new Error("Sesión inválida");
+    }
+    const data = await res.json();
+    const user = data.usuario || data.user || data;
+    localStorage.setItem("remesas_user", JSON.stringify(user));
+    ocultarLogin(user);
+    cargarDatosIniciales();
+  } catch (err) {
+    localStorage.removeItem("remesas_token");
+    localStorage.removeItem("remesas_user");
+    mostrarLogin();
+  }
 });
 
 function initServiceWorker() {
@@ -115,7 +275,7 @@ function initTabs() {
 // ========================================================
 async function cargarGruposWhatsApp() {
   try {
-    const res = await fetch(`${API_BASE}/api/grupos`);
+    const res = await apiFetch(`${API_BASE}/api/grupos`);
     AppState.grupos = await res.json();
     renderGrupos();
   } catch (err) {
@@ -211,7 +371,7 @@ async function procesarArchivoVoucher(archivo) {
   formData.append("grupo_whatsapp_nombre", AppState.grupoSeleccionado.nombre);
 
   try {
-    const res = await fetch(`${API_BASE}/api/vouchers/analizar-archivo`, {
+    const res = await apiFetch(`${API_BASE}/api/vouchers/analizar-archivo`, {
       method: "POST",
       body: formData
     });
@@ -386,7 +546,7 @@ async function reanalizarManual() {
   if (bancoDest) formData.append("banco_destino", bancoDest);
 
   try {
-    const res = await fetch(`${API_BASE}/api/vouchers/reanalizar-manual`, {
+    const res = await apiFetch(`${API_BASE}/api/vouchers/reanalizar-manual`, {
       method: "POST",
       body: formData
     });
@@ -422,7 +582,7 @@ function initActionButtons() {
         imagen_path: AppState.archivoGuardadoPath
       };
 
-      const res = await fetch(`${API_BASE}/api/vouchers/confirmar`, {
+      const res = await apiFetch(`${API_BASE}/api/vouchers/confirmar`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -454,7 +614,7 @@ function initActionButtons() {
         imagen_path: AppState.archivoGuardadoPath
       };
 
-      const res = await fetch(`${API_BASE}/api/vouchers/en-espera`, {
+      const res = await apiFetch(`${API_BASE}/api/vouchers/en-espera`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -490,7 +650,7 @@ function initActionButtons() {
         imagen_path: AppState.archivoGuardadoPath
       };
 
-      const res = await fetch(`${API_BASE}/api/vouchers/forzar-si`, {
+      const res = await apiFetch(`${API_BASE}/api/vouchers/forzar-si`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -568,7 +728,7 @@ async function cargarPendientes() {
   const badgeCount = document.getElementById("badge-pendientes-count");
   
   try {
-    const res = await fetch(`${API_BASE}/api/vouchers/pendientes`);
+    const res = await apiFetch(`${API_BASE}/api/vouchers/pendientes`);
     const pendientes = await res.json();
 
     if (pendientes.length > 0) {
@@ -653,7 +813,7 @@ function retomarVoucherPendiente(item) {
 async function forzarVoucherDirecto(item) {
   if (!confirm(`¿Forzar aprobación de Voucher #${item.id} por R$ ${item.monto}?`)) return;
   try {
-    const res = await fetch(`${API_BASE}/api/vouchers/forzar-si`, {
+    const res = await apiFetch(`${API_BASE}/api/vouchers/forzar-si`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -678,7 +838,7 @@ async function forzarVoucherDirecto(item) {
 
 async function recruzarTodosPendientes() {
   try {
-    const res = await fetch(`${API_BASE}/api/vouchers/recruzar-pendientes`, {
+    const res = await apiFetch(`${API_BASE}/api/vouchers/recruzar-pendientes`, {
       method: "POST"
     });
     const data = await res.json();
@@ -715,7 +875,7 @@ async function uploadExtractoManual() {
   showToast("Extrayendo depósitos con IA / Parser...", "info");
 
   try {
-    const res = await fetch(`${API_BASE}/api/extractos/upload`, {
+    const res = await apiFetch(`${API_BASE}/api/extractos/upload`, {
       method: "POST",
       body: formData
     });
@@ -746,7 +906,7 @@ async function cargarDepositosLibres() {
   const sumaEl = document.getElementById("suma-dep-libres");
 
   try {
-    const res = await fetch(`${API_BASE}/api/extractos/libres`);
+    const res = await apiFetch(`${API_BASE}/api/extractos/libres`);
     const depositos = await res.json();
 
     countEl.textContent = depositos.length;
@@ -793,7 +953,7 @@ async function cargarDepositosLibres() {
 // ========================================================
 async function cargarEstadisticas() {
   try {
-    const res = await fetch(`${API_BASE}/api/stats`);
+    const res = await apiFetch(`${API_BASE}/api/stats`);
     const s = await res.json();
     document.getElementById("stat-monto-conciliado").textContent = `R$ ${s.conciliados_monto.toLocaleString("es-BO", { minimumFractionDigits: 2 })}`;
     document.getElementById("stat-count-conciliado").textContent = s.conciliados_count;
@@ -807,7 +967,7 @@ async function cargarEstadisticas() {
 async function cargarHistorial() {
   const container = document.getElementById("lista-historial");
   try {
-    const res = await fetch(`${API_BASE}/api/vouchers/historial?limite=80`);
+    const res = await apiFetch(`${API_BASE}/api/vouchers/historial?limite=80`);
     const lista = await res.json();
 
     container.innerHTML = "";
@@ -860,7 +1020,7 @@ async function cargarHistorial() {
             return;
           }
           try {
-            const res = await fetch(`${API_BASE}/api/vouchers/${v.id}/anular`, {
+            const res = await apiFetch(`${API_BASE}/api/vouchers/${v.id}/anular`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ motivo: "Corrección manual desde historial" })
@@ -924,7 +1084,7 @@ async function cargarCierreCaja(fechaParam) {
   if (fechaInput) fechaInput.value = fecha;
 
   try {
-    const res = await fetch(`${API_BASE}/api/cierre-caja?fecha=${encodeURIComponent(fecha)}`);
+    const res = await apiFetch(`${API_BASE}/api/cierre-caja?fecha=${encodeURIComponent(fecha)}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Error cargando cierre de caja");
 
@@ -1092,7 +1252,7 @@ async function confirmarCierreCaja() {
   const observaciones = document.getElementById("cierre-observaciones")?.value || "";
 
   try {
-    const res = await fetch(`${API_BASE}/api/cierre-caja/cerrar`, {
+    const res = await apiFetch(`${API_BASE}/api/cierre-caja/cerrar`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

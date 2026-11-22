@@ -1,13 +1,16 @@
 import unicodedata
-from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 from database import (
+    DepositoNoDisponible,
+    ahora_negocio,
+    hoy_negocio,
     get_db_connection, 
     rows_to_list, 
     row_to_dict, 
     actualizar_voucher_estado,
     registrar_auditoria,
-    get_vouchers_pendientes
+    get_vouchers_pendientes,
+    marcar_sheets_sync,
 )
 
 TOLERANCIA_CENTAVOS = 0.01  # Para comparaciones de coma flotante
@@ -47,7 +50,7 @@ def analizar_conciliacion_voucher(
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    hoy_str = datetime.now().strftime("%Y-%m-%d")
+    hoy_str = hoy_negocio()
     es_fecha_anterior = 1 if fecha_comprobante < hoy_str else 0
 
     # 1. VERIFICACIÓN DE FRAUDE / DUPLICADO
@@ -171,53 +174,62 @@ def confirmar_conciliacion_reconciler(
     voucher_id: int, 
     deposito_id: Optional[int], 
     modo: str = "AUTOMATICO", 
-    observaciones: str = ""
+    observaciones: str = "",
+    usuario: str = "Back-office"
 ) -> Dict[str, Any]:
     """
     Bloquea el depósito como USADO, pasa el voucher a CONCILIADO (o FORZADO_MANUAL)
     y registra auditoría.
     """
     conn = get_db_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    estado_final = "FORZADO_MANUAL" if modo == "FORZADO" else "CONCILIADO"
-    now = datetime.now().isoformat()
+        estado_final = "FORZADO_MANUAL" if modo == "FORZADO" else "CONCILIADO"
+        now = ahora_negocio().isoformat()
 
-    # Actualizar voucher
-    cursor.execute("""
-        UPDATE vouchers
-        SET estado = ?,
-            deposito_asociado_id = ?,
-            fecha_conciliacion = ?,
-            observaciones = CASE WHEN ? != '' THEN ? ELSE observaciones END
-        WHERE id = ?;
-    """, (estado_final, deposito_id, now, observaciones, observaciones, voucher_id))
-
-    # Si hay depósito vinculado, marcarlo como USADO
-    if deposito_id:
+        # Actualizar voucher
         cursor.execute("""
-            UPDATE depositos_extracto
-            SET estado = 'USADO',
-                voucher_id = ?
+            UPDATE vouchers
+            SET estado = ?,
+                deposito_asociado_id = ?,
+                fecha_conciliacion = ?,
+                observaciones = CASE WHEN ? != '' THEN ? ELSE observaciones END
             WHERE id = ?;
-        """, (voucher_id, deposito_id))
+        """, (estado_final, deposito_id, now, observaciones, observaciones, voucher_id))
 
-    # Auditoría
-    if modo == "DESEMPATE":
-        accion_audit = "DESEMPATE_MANUAL"
-    elif modo == "FORZADO":
-        accion_audit = "FORZADO_MANUAL"
-    elif modo == "AUTO_RECRUCE":
-        accion_audit = "AUTO_RECRUCE"
-    else:
-        accion_audit = "MATCH_AUTOMATICO"
-    cursor.execute("""
-        INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles)
-        VALUES (?, ?, ?, ?);
-    """, (voucher_id, deposito_id, accion_audit, f"Modo: {modo}. {observaciones}"))
+        # Si hay depósito vinculado, marcarlo como USADO de forma atómica
+        if deposito_id:
+            cursor.execute("""
+                UPDATE depositos_extracto
+                SET estado = 'USADO',
+                    voucher_id = ?
+                WHERE id = ? AND (estado = 'LIBRE' OR voucher_id = ?);
+            """, (voucher_id, deposito_id, voucher_id))
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise DepositoNoDisponible("Ese depósito ya fue usado por otra operación; vuelve a verificar el cruce")
 
-    conn.commit()
-    conn.close()
+        # Auditoría
+        if modo == "DESEMPATE":
+            accion_audit = "DESEMPATE_MANUAL"
+        elif modo == "FORZADO":
+            accion_audit = "FORZADO_MANUAL"
+        elif modo == "AUTO_RECRUCE":
+            accion_audit = "AUTO_RECRUCE"
+        else:
+            accion_audit = "MATCH_AUTOMATICO"
+        cursor.execute("""
+            INSERT INTO auditoria_conciliaciones (voucher_id, deposito_id, accion, detalles, usuario)
+            VALUES (?, ?, ?, ?, ?);
+        """, (voucher_id, deposito_id, accion_audit, f"Modo: {modo}. {observaciones}", usuario or "Back-office"))
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     return {
         "success": True,
@@ -228,7 +240,7 @@ def confirmar_conciliacion_reconciler(
     }
 
 
-def recruzar_pendientes_automatico() -> Dict[str, Any]:
+def recruzar_pendientes_automatico(usuario: str = "Back-office") -> Dict[str, Any]:
     """
     Re-evalúa todos los vouchers EN_ESPERA contra los depósitos libres disponibles
     y concilia automáticamente los que tengan coincidencia exacta única.
@@ -246,15 +258,24 @@ def recruzar_pendientes_automatico() -> Dict[str, Any]:
             banco_destino=v.get("banco_destino")
         )
         if diag["estado_diagnostico"] in ("MATCH_EXACTO", "MATCH_FECHA_ANTERIOR") and diag.get("deposito_id"):
-            confirmar_conciliacion_reconciler(
-                voucher_id=v["id"],
-                deposito_id=diag["deposito_id"],
-                modo="AUTO_RECRUCE",
-                observaciones="Conciliado automáticamente al cargar extracto"
-            )
-            sheets_sync.sincronizar_voucher_sheets(
+            try:
+                confirmar_conciliacion_reconciler(
+                    voucher_id=v["id"],
+                    deposito_id=diag["deposito_id"],
+                    modo="AUTO_RECRUCE",
+                    observaciones="Conciliado automáticamente al cargar extracto",
+                    usuario=usuario
+                )
+            except DepositoNoDisponible:
+                continue
+            sheets_res = sheets_sync.sincronizar_voucher_sheets(
                 {**v, "estado": "CONCILIADO", "deposito_asociado_id": diag["deposito_id"]},
                 estado_display="🟢 SÍ"
+            )
+            marcar_sheets_sync(
+                v["id"],
+                bool(sheets_res.get("success") and not sheets_res.get("simulado")),
+                sheets_res.get("error"),
             )
             resueltos.append({
                 "voucher_id": v["id"],

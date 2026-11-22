@@ -20,6 +20,7 @@ backend/remesas.db-shm
 storage/Historial/*
 !storage/Historial/.gitkeep
 !storage/Historial/*/.gitkeep
+storage/respaldos/
 
 # Credenciales de Google
 backend/credentials.json

@@ -5,7 +5,8 @@
   "description": "Lee movimientos de pestañas bancarias abiertas (Itaú, Bradesco, etc.) y los envía al servidor de remesas.",
   "permissions": [
     "activeTab",
-    "scripting"
+    "scripting",
+    "storage"
   ],
   "action": {
     "default_popup": "popup.html"

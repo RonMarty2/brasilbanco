@@ -1,6 +1,7 @@
 import os
-from datetime import datetime
 from typing import Dict, Any, Optional
+
+import database as db
 
 # Intentar importar librerías oficiales de Google Sheets
 HAS_GSPREAD = False
@@ -55,8 +56,8 @@ def sincronizar_voucher_sheets(voucher: Dict[str, Any], estado_display: str = "�
     Si no está configurado o falla, devuelve simulación exitosa sin romper el flujo (Tolerancia a fallos).
     """
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", SPREADSHEET_ID)
-    fecha_voucher = voucher.get("fecha_comprobante", datetime.now().strftime("%Y-%m-%d"))
-    hoy_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    fecha_voucher = voucher.get("fecha_comprobante") or db.hoy_negocio()
+    hoy_str = db.ahora_negocio().strftime("%Y-%m-%d %H:%M")
 
     # Si no hay ID de spreadsheet o credenciales, opera en modo tolerancia a fallos
     client = _obtener_cliente_sheets()
@@ -135,7 +136,7 @@ def sincronizar_voucher_sheets(voucher: Dict[str, Any], estado_display: str = "�
 def sincronizar_cierre_sheets(cierre_resumen: Dict[str, Any]) -> Dict[str, Any]:
     """Registra o actualiza una fila de cierre diario en la pestaña CIERRES_CAJA de Google Sheets."""
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", SPREADSHEET_ID)
-    fecha = cierre_resumen.get("fecha", datetime.now().strftime("%Y-%m-%d"))
+    fecha = cierre_resumen.get("fecha") or db.hoy_negocio()
     tot = cierre_resumen.get("totales", {})
     cierre = cierre_resumen.get("cierre_guardado") or {}
 
