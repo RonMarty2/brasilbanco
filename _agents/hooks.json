@@ -3,14 +3,14 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "\"C:/Program Files/Python311/python.exe\" \"C:/Users/lmigu/SynologyDrive/12.NUBES/_AGENTES_CENTRAL/herramientas/agy_puente.py\" --evento SessionStart \"retomar_taller.py\" \"retomar_carpeta.py\" \"aviso_onedrive.py\" \"catalogo_al_dia.py\" \"../monitor/abrir_monitor.py\"",
+        "command": "python -c \"import os,sys,runpy; h=os.path.expanduser('~'); b='/herramientas/agy_puente.py'; c=[h+'/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,h+'/SynologyDrive/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/_AGENTES_CENTRAL'+b]; p=next((x for x in c if os.path.exists(x)),''); p and (sys.path.insert(0,os.path.dirname(p)),sys.argv.__setitem__(slice(0,1),[p]),runpy.run_path(p,run_name='__main__'))\" --evento SessionStart \"retomar_taller.py\" \"retomar_carpeta.py\" \"aviso_onedrive.py\" \"catalogo_al_dia.py\" \"../monitor/abrir_monitor.py\"",
         "timeout": 30
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "\"C:/Program Files/Python311/python.exe\" \"C:/Users/lmigu/SynologyDrive/12.NUBES/_AGENTES_CENTRAL/herramientas/agy_puente.py\" --evento PreInvocation \"sugerir_agente.py\" \"recomendar_modelo.py\" \"decisiones.py\" \"ancla_hook.py\" \"autoaviso_desperdicio.py\"",
+        "command": "python -c \"import os,sys,runpy; h=os.path.expanduser('~'); b='/herramientas/agy_puente.py'; c=[h+'/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,h+'/SynologyDrive/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/_AGENTES_CENTRAL'+b]; p=next((x for x in c if os.path.exists(x)),''); p and (sys.path.insert(0,os.path.dirname(p)),sys.argv.__setitem__(slice(0,1),[p]),runpy.run_path(p,run_name='__main__'))\" --evento PreInvocation \"sugerir_agente.py\" \"recomendar_modelo.py\" \"decisiones.py\" \"ancla_hook.py\" \"autoaviso_desperdicio.py\"",
         "timeout": 25
       }
     ],
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"C:/Program Files/Python311/python.exe\" \"C:/Users/lmigu/SynologyDrive/12.NUBES/_AGENTES_CENTRAL/herramientas/agy_puente.py\" --evento PreToolUse \"guardia_espejos.py\" \"exigir_agente.py\" \"puerta_agy.py\" \"pedido_con_reglas.py\" \"comando_pesado.py\" \"consulta_agy_repetida.py\" \"contador_lecturas.py\" \"control_delegacion.py\" \"regla_vieja.py\" \"control_chrome.py\"",
+            "command": "python -c \"import os,sys,runpy; h=os.path.expanduser('~'); b='/herramientas/agy_puente.py'; c=[h+'/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,h+'/SynologyDrive/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/_AGENTES_CENTRAL'+b]; p=next((x for x in c if os.path.exists(x)),''); p and (sys.path.insert(0,os.path.dirname(p)),sys.argv.__setitem__(slice(0,1),[p]),runpy.run_path(p,run_name='__main__'))\" --evento PreToolUse \"guardia_espejos.py\" \"exigir_agente.py\" \"puerta_agy.py\" \"pedido_con_reglas.py\" \"comando_pesado.py\" \"consulta_agy_repetida.py\" \"contador_lecturas.py\" \"control_delegacion.py\" \"regla_vieja.py\" \"control_chrome.py\"",
             "timeout": 25
           }
         ]
@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"C:/Program Files/Python311/python.exe\" \"C:/Users/lmigu/SynologyDrive/12.NUBES/_AGENTES_CENTRAL/herramientas/agy_puente.py\" --evento PostToolUse \"decisiones.py\" \"receta_cargada.py\" \"agy_cuota.py\" \"autoaviso_desperdicio.py\"",
+            "command": "python -c \"import os,sys,runpy; h=os.path.expanduser('~'); b='/herramientas/agy_puente.py'; c=[h+'/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,h+'/SynologyDrive/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/_AGENTES_CENTRAL'+b]; p=next((x for x in c if os.path.exists(x)),''); p and (sys.path.insert(0,os.path.dirname(p)),sys.argv.__setitem__(slice(0,1),[p]),runpy.run_path(p,run_name='__main__'))\" --evento PostToolUse \"decisiones.py\" \"receta_cargada.py\" \"agy_cuota.py\" \"autoaviso_desperdicio.py\"",
             "timeout": 20
           }
         ]
@@ -41,7 +41,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "\"C:/Program Files/Python311/python.exe\" \"C:/Users/lmigu/SynologyDrive/12.NUBES/_AGENTES_CENTRAL/herramientas/agy_puente.py\" --evento Stop \"revisar_respuesta.py\" \"cierre_por_contexto.py\" \"punto_control_cuota.py\"",
+        "command": "python -c \"import os,sys,runpy; h=os.path.expanduser('~'); b='/herramientas/agy_puente.py'; c=[h+'/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,h+'/SynologyDrive/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/12.NUBES/_AGENTES_CENTRAL'+b,'C:/SynologyDrive/SynologyDrive/_AGENTES_CENTRAL'+b]; p=next((x for x in c if os.path.exists(x)),''); p and (sys.path.insert(0,os.path.dirname(p)),sys.argv.__setitem__(slice(0,1),[p]),runpy.run_path(p,run_name='__main__'))\" --evento Stop \"revisar_respuesta.py\" \"cierre_por_contexto.py\" \"punto_control_cuota.py\"",
         "timeout": 30
       }
     ]
