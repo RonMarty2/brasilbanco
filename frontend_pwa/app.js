@@ -16,8 +16,64 @@ const AppState = {
   modoOperacion: "AUTOMATICO",
   archivoGuardadoPath: "",
   voucherPendienteEditandoId: null,
-  cierreActual: null
+  cierreActual: null,
+  colaVouchers: [],
+  historialLista: [],
+  libresLista: [],
+  previewObjectUrl: null,
+  modalTempBlobUrl: null,
+  procesandoVoucher: false
 };
+
+// ========================================================
+// HELPERS DE SEGURIDAD, UI Y RED
+// ========================================================
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function conBotonOcupado(btn, asyncFn) {
+  if (!btn) return asyncFn();
+  if (btn.disabled) return;
+  const htmlOriginal = btn.innerHTML;
+  btn.disabled = true;
+  btn.classList.add("opacity-60", "cursor-not-allowed");
+  try {
+    return await asyncFn();
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("opacity-60", "cursor-not-allowed");
+    if (btn.innerHTML !== htmlOriginal) {
+      btn.innerHTML = htmlOriginal;
+    }
+  }
+}
+
+async function parsearJsonSeguro(res, mensajeDefault = "Error en el servidor") {
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.detail || data.error || mensajeDefault);
+  }
+  return data;
+}
+
+function actualizarEstadoConexion() {
+  const badge = document.getElementById("conn-status");
+  if (!badge) return;
+  if (navigator.onLine) {
+    badge.textContent = "● Online";
+    badge.className = "inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-950 text-emerald-400 border border-emerald-800";
+  } else {
+    badge.textContent = "○ Offline";
+    badge.className = "inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-rose-950 text-rose-400 border border-rose-800";
+  }
+}
 
 // ========================================================
 // AUTENTICACIÓN Y API FETCH
@@ -138,6 +194,7 @@ function initAuth() {
 
         ocultarLogin(user);
         cargarDatosIniciales();
+        await procesarVoucherCompartido();
         showToast(`Bienvenido, ${user.nombre || nombre}`, "success");
       } catch (err) {
         if (errEl) {
@@ -164,10 +221,22 @@ function initAuth() {
 // INICIALIZACIÓN Y SERVICE WORKER
 // ========================================================
 document.addEventListener("DOMContentLoaded", async () => {
+  actualizarEstadoConexion();
+  window.addEventListener("online", () => {
+    actualizarEstadoConexion();
+    showToast("Conexión restablecida", "success");
+  });
+  window.addEventListener("offline", () => {
+    actualizarEstadoConexion();
+    showToast("Sin conexión a internet", "warning");
+  });
+
   initServiceWorker();
   initTabs();
+  initModalImagen();
   initVoucherUpload();
   initActionButtons();
+  initFiltrosEnVivo();
   initCierreCaja();
   initAuth();
 
@@ -179,14 +248,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   try {
     const res = await apiFetch(`${API_BASE}/api/auth/yo`);
-    if (!res.ok) {
-      throw new Error("Sesión inválida");
-    }
-    const data = await res.json();
+    const data = await parsearJsonSeguro(res, "Sesión inválida");
     const user = data.usuario || data.user || data;
     localStorage.setItem("remesas_user", JSON.stringify(user));
     ocultarLogin(user);
     cargarDatosIniciales();
+    await procesarVoucherCompartido();
   } catch (err) {
     localStorage.removeItem("remesas_token");
     localStorage.removeItem("remesas_user");
@@ -202,13 +269,141 @@ function initServiceWorker() {
   }
 }
 
+async function procesarVoucherCompartido() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("shared") !== "1") return;
+
+  params.delete("shared");
+  const newSearch = params.toString();
+  const cleanUrl = window.location.pathname + (newSearch ? `?${newSearch}` : "") + window.location.hash;
+  window.history.replaceState(null, "", cleanUrl);
+
+  if (!("caches" in window)) return;
+
+  try {
+    const cache = await caches.open("remesas-share-tmp");
+    const resp = await cache.match("/shared-voucher");
+    if (!resp) return;
+
+    const blob = await resp.blob();
+    const rawName = resp.headers.get("X-Filename");
+    const filename = rawName ? decodeURIComponent(rawName) : "voucher.jpg";
+    const contentType = resp.headers.get("Content-Type") || blob.type || "image/jpeg";
+    const file = new File([blob], filename, { type: contentType });
+
+    await cache.delete("/shared-voucher");
+
+    AppState.colaVouchers.push(file);
+    actualizarBannerCola();
+
+    if (!AppState.grupoSeleccionado) {
+      showToast("📲 Comprobante recibido desde WhatsApp. Selecciona el Grupo de WhatsApp para analizarlo.", "info");
+    } else if (!AppState.procesandoVoucher && document.getElementById("resultado-voucher").classList.contains("hidden")) {
+      await procesarSiguienteEnCola();
+    }
+  } catch (err) {
+    console.error("Error leyendo voucher compartido:", err);
+    showToast("No se pudo recuperar el comprobante compartido", "error");
+  }
+}
+
+// ========================================================
+// VISOR DE IMAGEN (MODAL)
+// ========================================================
+function initModalImagen() {
+  const modal = document.getElementById("modal-imagen");
+  const btnCerrar = document.getElementById("btn-cerrar-modal-imagen");
+  const previewImg = document.getElementById("voucher-preview-img");
+
+  if (btnCerrar) {
+    btnCerrar.addEventListener("click", cerrarModalImagen);
+  }
+  if (modal) {
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) cerrarModalImagen();
+    });
+  }
+  if (previewImg) {
+    previewImg.addEventListener("click", () => {
+      if (previewImg.src) {
+        abrirModalImagen(previewImg.src, "Comprobante actual", false);
+      }
+    });
+  }
+}
+
+function abrirModalImagen(src, titulo = "Comprobante", esTempBlob = false) {
+  const modal = document.getElementById("modal-imagen");
+  const img = document.getElementById("modal-imagen-img");
+  const titleEl = document.getElementById("modal-imagen-titulo");
+  if (!modal || !img) return;
+
+  if (AppState.modalTempBlobUrl) {
+    URL.revokeObjectURL(AppState.modalTempBlobUrl);
+    AppState.modalTempBlobUrl = null;
+  }
+  if (esTempBlob) {
+    AppState.modalTempBlobUrl = src;
+  }
+
+  img.src = src;
+  if (titleEl) titleEl.textContent = titulo;
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+}
+
+function cerrarModalImagen() {
+  const modal = document.getElementById("modal-imagen");
+  const img = document.getElementById("modal-imagen-img");
+  if (modal) {
+    modal.classList.add("hidden");
+    modal.classList.remove("flex");
+  }
+  if (img) img.src = "";
+  if (AppState.modalTempBlobUrl) {
+    URL.revokeObjectURL(AppState.modalTempBlobUrl);
+    AppState.modalTempBlobUrl = null;
+  }
+}
+
+async function verFotoVoucher(imagenPath, etiqueta = "") {
+  if (!imagenPath) return;
+  try {
+    const res = await apiFetch(`${API_BASE}/api/vouchers/imagen?path=${encodeURIComponent(imagenPath)}`);
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.detail || "No se pudo cargar la imagen");
+    }
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    if (blob.type === "application/pdf") {
+      window.open(blobUrl, "_blank");
+      return;
+    }
+    abrirModalImagen(blobUrl, `Comprobante ${etiqueta}`, true);
+  } catch (err) {
+    showToast("Error cargando foto: " + err.message, "error");
+  }
+}
+
+function limpiarPreviewLocal() {
+  const box = document.getElementById("voucher-preview-box");
+  const img = document.getElementById("voucher-preview-img");
+  if (box) box.classList.add("hidden");
+  if (img) img.src = "";
+  if (AppState.previewObjectUrl) {
+    URL.revokeObjectURL(AppState.previewObjectUrl);
+    AppState.previewObjectUrl = null;
+  }
+}
+
 // ========================================================
 // NOTIFICACIONES TOAST
 // ========================================================
 function showToast(mensaje, tipo = "info") {
   const container = document.getElementById("toast-container");
   const toast = document.createElement("div");
-  
+
   let bgClass = "bg-slate-900 border-slate-700 text-slate-200";
   let icon = "ℹ️";
   if (tipo === "success") {
@@ -223,7 +418,7 @@ function showToast(mensaje, tipo = "info") {
   }
 
   toast.className = `${bgClass} border rounded-2xl px-4 py-2.5 shadow-2xl flex items-center space-x-2 text-xs font-medium max-w-sm w-full transition-all duration-300 transform translate-y-2 opacity-0`;
-  toast.innerHTML = `<span>${icon}</span><span class="flex-1">${mensaje}</span>`;
+  toast.innerHTML = `<span>${icon}</span><span class="flex-1">${escapeHtml(mensaje)}</span>`;
   container.appendChild(toast);
 
   setTimeout(() => {
@@ -244,8 +439,7 @@ function initTabs() {
   navTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
       const targetId = tab.getAttribute("data-target");
-      
-      // Actualizar botones
+
       navTabs.forEach((t) => {
         t.classList.remove("text-emerald-400", "active");
         t.classList.add("text-slate-400");
@@ -253,12 +447,10 @@ function initTabs() {
       tab.classList.add("text-emerald-400", "active");
       tab.classList.remove("text-slate-400");
 
-      // Actualizar secciones
       document.querySelectorAll(".tab-content").forEach((c) => c.classList.add("hidden"));
       const targetEl = document.getElementById(targetId);
       if (targetEl) targetEl.classList.remove("hidden");
 
-      // Refrescos automáticos según pestaña
       if (targetId === "tab-pendientes") cargarPendientes();
       if (targetId === "tab-extractos") cargarDepositosLibres();
       if (targetId === "tab-historial") {
@@ -271,16 +463,15 @@ function initTabs() {
 }
 
 // ========================================================
-// GRUPOS DE WHATSAPP (ORIGEN OBLIGATORIO)
+// GRUPOS DE WHATSAPP (ORIGEN OBLIGATORIO - SIN PRESELECCIÓN)
 // ========================================================
 async function cargarGruposWhatsApp() {
   try {
     const res = await apiFetch(`${API_BASE}/api/grupos`);
-    AppState.grupos = await res.json();
+    AppState.grupos = await parsearJsonSeguro(res, "Error cargando grupos");
     renderGrupos();
   } catch (err) {
     console.error("Error cargando grupos:", err);
-    // Fallback local
     AppState.grupos = [
       { id: 1, nombre: "Grupo São Paulo 🇧🇷", color: "#10B981" },
       { id: 2, nombre: "Grupo Rio de Janeiro 🇧🇷", color: "#3B82F6" },
@@ -295,10 +486,6 @@ function renderGrupos() {
   const container = document.getElementById("grupos-container");
   container.innerHTML = "";
 
-  if (!AppState.grupoSeleccionado && AppState.grupos.length > 0) {
-    AppState.grupoSeleccionado = AppState.grupos[0];
-  }
-
   AppState.grupos.forEach((grupo) => {
     const isSelected = AppState.grupoSeleccionado && AppState.grupoSeleccionado.id === grupo.id;
     const btn = document.createElement("button");
@@ -308,21 +495,77 @@ function renderGrupos() {
         ? "bg-emerald-500 text-slate-950 border-emerald-400 shadow-md shadow-emerald-500/20"
         : "bg-slate-950 text-slate-300 border-slate-700 hover:border-slate-500"
     }`;
-    btn.innerHTML = `<span class="w-2 h-2 rounded-full" style="background-color: ${grupo.color}"></span><span>${grupo.nombre}</span>`;
+    btn.innerHTML = `<span class="w-2 h-2 rounded-full" style="background-color: ${escapeHtml(grupo.color || "#10B981")}"></span><span>${escapeHtml(grupo.nombre)}</span>`;
     btn.addEventListener("click", () => {
       AppState.grupoSeleccionado = grupo;
       renderGrupos();
+      if (
+        AppState.colaVouchers.length > 0 &&
+        !AppState.procesandoVoucher &&
+        document.getElementById("resultado-voucher").classList.contains("hidden")
+      ) {
+        procesarSiguienteEnCola();
+      }
     });
     container.appendChild(btn);
   });
 }
 
 // ========================================================
-// CARGA Y PROCESAMIENTO DE VOUCHERS (GEMINI FLASH)
+// COLA Y PROCESAMIENTO DE VOUCHERS (GEMINI FLASH)
 // ========================================================
+function actualizarBannerCola() {
+  const banner = document.getElementById("cola-vouchers-banner");
+  const texto = document.getElementById("cola-vouchers-texto");
+  if (!banner || !texto) return;
+
+  const n = AppState.colaVouchers.length;
+  if (n > 0) {
+    texto.textContent = `📚 ${n} comprobante(s) pendiente(s) en cola`;
+    banner.classList.remove("hidden");
+  } else {
+    banner.classList.add("hidden");
+  }
+}
+
+function encolarArchivosVouchers(fileList) {
+  const archivos = Array.from(fileList || []).filter(Boolean);
+  if (archivos.length === 0) return;
+
+  AppState.colaVouchers.push(...archivos);
+  actualizarBannerCola();
+
+  if (!AppState.grupoSeleccionado) {
+    showToast("Selecciona primero el Grupo de WhatsApp origen para procesar", "warning");
+    return;
+  }
+
+  if (!AppState.procesandoVoucher && document.getElementById("resultado-voucher").classList.contains("hidden")) {
+    procesarSiguienteEnCola();
+  } else {
+    showToast(`📚 ${archivos.length} comprobante(s) agregado(s) a la cola`, "info");
+  }
+}
+
+async function procesarSiguienteEnCola() {
+  if (AppState.procesandoVoucher || AppState.colaVouchers.length === 0) {
+    actualizarBannerCola();
+    return;
+  }
+  if (!AppState.grupoSeleccionado) {
+    showToast("Por favor selecciona primero el Grupo de WhatsApp de origen", "warning");
+    return;
+  }
+
+  const siguiente = AppState.colaVouchers.shift();
+  actualizarBannerCola();
+  await procesarArchivoVoucher(siguiente);
+}
+
 function initVoucherUpload() {
   const dropZone = document.getElementById("drop-zone");
   const fileInput = document.getElementById("voucher-file-input");
+  const btnLimpiarCola = document.getElementById("btn-limpiar-cola");
 
   dropZone.addEventListener("click", () => fileInput.click());
 
@@ -338,19 +581,32 @@ function initVoucherUpload() {
   dropZone.addEventListener("drop", (e) => {
     e.preventDefault();
     dropZone.classList.remove("border-emerald-500", "bg-emerald-500/5");
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      procesarArchivoVoucher(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      encolarArchivosVouchers(e.dataTransfer.files);
     }
   });
 
   fileInput.addEventListener("change", (e) => {
-    if (e.target.files && e.target.files[0]) {
-      procesarArchivoVoucher(e.target.files[0]);
+    if (e.target.files && e.target.files.length > 0) {
+      encolarArchivosVouchers(e.target.files);
+      fileInput.value = "";
     }
   });
 
-  // Botón para recalcular diagnóstico si el usuario edita datos con el dedo
-  document.getElementById("btn-recalcular").addEventListener("click", reanalizarManual);
+  if (btnLimpiarCola) {
+    btnLimpiarCola.addEventListener("click", () => {
+      AppState.colaVouchers = [];
+      actualizarBannerCola();
+      if (document.getElementById("resultado-voucher").classList.contains("hidden")) {
+        AppState.grupoSeleccionado = null;
+        renderGrupos();
+      }
+      showToast("Cola de comprobantes vaciada", "info");
+    });
+  }
+
+  const btnRecalcular = document.getElementById("btn-recalcular");
+  btnRecalcular.addEventListener("click", () => conBotonOcupado(btnRecalcular, reanalizarManual));
 }
 
 async function procesarArchivoVoucher(archivo) {
@@ -361,9 +617,21 @@ async function procesarArchivoVoucher(archivo) {
 
   const loadingEl = document.getElementById("ai-loading");
   const resultadoEl = document.getElementById("resultado-voucher");
-  
+
+  AppState.procesandoVoucher = true;
   loadingEl.classList.remove("hidden");
   resultadoEl.classList.add("hidden");
+
+  limpiarPreviewLocal();
+  if (archivo.type && archivo.type.startsWith("image/")) {
+    const previewBox = document.getElementById("voucher-preview-box");
+    const previewImg = document.getElementById("voucher-preview-img");
+    AppState.previewObjectUrl = URL.createObjectURL(archivo);
+    if (previewImg && previewBox) {
+      previewImg.src = AppState.previewObjectUrl;
+      previewBox.classList.remove("hidden");
+    }
+  }
 
   const formData = new FormData();
   formData.append("archivo", archivo);
@@ -376,12 +644,7 @@ async function procesarArchivoVoucher(archivo) {
       body: formData
     });
 
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.detail || "Error en el servidor al analizar voucher");
-    }
-
-    const data = await res.json();
+    const data = await parsearJsonSeguro(res, "Error en el servidor al analizar voucher");
     loadingEl.classList.add("hidden");
 
     AppState.voucherActual = data.datos_extraidos;
@@ -398,11 +661,13 @@ async function procesarArchivoVoucher(archivo) {
     } else {
       showToast("Voucher analizado con éxito", "success");
     }
-
   } catch (err) {
     loadingEl.classList.add("hidden");
+    limpiarPreviewLocal();
     showToast("Error analizando con IA: " + err.message, "error");
     console.error(err);
+  } finally {
+    AppState.procesandoVoucher = false;
   }
 }
 
@@ -438,7 +703,7 @@ function renderDiagnostico(diag) {
         <span class="text-3xl">🚨</span>
         <div>
           <h3 class="text-sm font-extrabold uppercase tracking-wide text-rose-400">ALERTA CRÍTICA DE FRAUDE / DUPLICADO</h3>
-          <p class="text-xs mt-1 text-rose-300 leading-relaxed">${diag.mensaje}</p>
+          <p class="text-xs mt-1 text-rose-300 leading-relaxed">${escapeHtml(diag.mensaje)}</p>
         </div>
       </div>
     `;
@@ -460,9 +725,9 @@ function renderDiagnostico(diag) {
           <h3 class="text-sm font-extrabold uppercase tracking-wide text-emerald-400">
             ${diag.es_fecha_anterior ? "COINCIDENCIA EN FECHA ANTERIOR CONFIRMADA" : "COINCIDENCIA ÚNICA CONFIRMADA"}
           </h3>
-          <p class="text-xs mt-1 text-emerald-200 leading-relaxed">${diag.mensaje}</p>
+          <p class="text-xs mt-1 text-emerald-200 leading-relaxed">${escapeHtml(diag.mensaje)}</p>
           <div class="mt-2.5 p-2 bg-slate-900/80 rounded-xl border border-emerald-500/30 text-[11px] font-mono text-emerald-300">
-            <strong>Depósito:</strong> ${diag.deposito.banco} | ${diag.deposito.descripcion} | R$ ${diag.deposito.monto.toFixed(2)}
+            <strong>Depósito:</strong> ${escapeHtml(diag.deposito.banco)} | ${escapeHtml(diag.deposito.descripcion)} | R$ ${Number(diag.deposito.monto).toFixed(2)}
           </div>
         </div>
       </div>
@@ -475,12 +740,11 @@ function renderDiagnostico(diag) {
         <span class="text-3xl">🟡</span>
         <div>
           <h3 class="text-sm font-extrabold uppercase tracking-wide text-amber-400">COLISIÓN DE MONTOS (DESEMPATE REQUERIDO)</h3>
-          <p class="text-xs mt-1 text-amber-200 leading-relaxed">${diag.mensaje}</p>
+          <p class="text-xs mt-1 text-amber-200 leading-relaxed">${escapeHtml(diag.mensaje)}</p>
         </div>
       </div>
     `;
 
-    // Renderizar candidatos de desempate
     empateContainer.classList.remove("hidden");
     diag.candidatos.forEach((cand, idx) => {
       const card = document.createElement("div");
@@ -489,11 +753,11 @@ function renderDiagnostico(diag) {
       }`;
       card.innerHTML = `
         <div class="text-xs space-y-0.5">
-          <p class="font-bold text-white">${cand.banco} - <span class="font-mono text-emerald-400">R$ ${cand.monto.toFixed(2)}</span></p>
-          <p class="text-slate-400 text-[11px]">${cand.descripcion}</p>
-          <p class="text-slate-500 text-[10px]">Hora: ${cand.hora || 'No especificada'} | Fecha: ${cand.fecha}</p>
+          <p class="font-bold text-white">${escapeHtml(cand.banco)} - <span class="font-mono text-emerald-400">R$ ${Number(cand.monto).toFixed(2)}</span></p>
+          <p class="text-slate-400 text-[11px]">${escapeHtml(cand.descripcion)}</p>
+          <p class="text-slate-500 text-[10px]">Hora: ${escapeHtml(cand.hora || "No especificada")} | Fecha: ${escapeHtml(cand.fecha)}</p>
         </div>
-        <input type="radio" name="candidato-radio" value="${cand.id}" ${idx === 0 ? "checked" : ""} class="text-amber-500 focus:ring-amber-500">
+        <input type="radio" name="candidato-radio" value="${escapeHtml(cand.id)}" ${idx === 0 ? "checked" : ""} class="text-amber-500 focus:ring-amber-500">
       `;
       if (idx === 0) AppState.depositoSeleccionadoId = cand.id;
 
@@ -509,9 +773,7 @@ function renderDiagnostico(diag) {
 
       listaCandidatos.appendChild(card);
     });
-
   } else {
-    // SIN COINCIDENCIA (ROJO)
     AppState.depositoSeleccionadoId = null;
     AppState.modoOperacion = "AUTOMATICO";
     banner.className = "rounded-2xl p-4 border bg-rose-950/60 border-rose-500/50 text-rose-200 shadow-rose-950/40 shadow-lg";
@@ -520,7 +782,7 @@ function renderDiagnostico(diag) {
         <span class="text-3xl">🔴</span>
         <div>
           <h3 class="text-sm font-extrabold uppercase tracking-wide text-rose-400">DEPÓSITO NO REGISTRADO EN EXTRACTO</h3>
-          <p class="text-xs mt-1 text-rose-200 leading-relaxed">${diag.mensaje}</p>
+          <p class="text-xs mt-1 text-rose-200 leading-relaxed">${escapeHtml(diag.mensaje)}</p>
         </div>
       </div>
     `;
@@ -550,7 +812,7 @@ async function reanalizarManual() {
       method: "POST",
       body: formData
     });
-    const data = await res.json();
+    const data = await parsearJsonSeguro(res, "Error al re-verificar cruce");
     AppState.diagnosticoActual = data.diagnostico;
     renderDiagnostico(data.diagnostico);
     showToast("Cruce actualizado con nuevos valores", "info");
@@ -563,115 +825,128 @@ async function reanalizarManual() {
 // ACCIONES INQUEBRANTABLES: CONFIRMAR, EN ESPERA, FORZAR SÍ
 // ========================================================
 function initActionButtons() {
-  // 1. Confirmar y Conciliar
-  document.getElementById("btn-confirmar-conciliacion").addEventListener("click", async () => {
-    const datos = obtenerDatosFormulario();
-    if (!datos) return;
+  const btnConfirmar = document.getElementById("btn-confirmar-conciliacion");
+  btnConfirmar.addEventListener("click", () =>
+    conBotonOcupado(btnConfirmar, async () => {
+      const datos = obtenerDatosFormulario();
+      if (!datos) return;
 
-    if (!AppState.depositoSeleccionadoId && AppState.diagnosticoActual?.estado_diagnostico === "SIN_COINCIDENCIA") {
-      showToast("No hay depósito coincidente. Usa 'Dejar En Espera' o 'Forzar SÍ Manual'", "warning");
-      return;
-    }
-
-    try {
-      const payload = {
-        ...datos,
-        id: AppState.voucherPendienteEditandoId,
-        deposito_asociado_id: AppState.depositoSeleccionadoId,
-        modo: AppState.modoOperacion,
-        imagen_path: AppState.archivoGuardadoPath
-      };
-
-      const res = await apiFetch(`${API_BASE}/api/vouchers/confirmar`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const resp = await res.json();
-      if (resp.success) {
-        showToast("🟢 Voucher CONCILIADO exitosamente y marcado en Google Sheets", "success");
-        resetearFormularioVoucher();
-        cargarEstadisticas();
-        cargarPendientes();
-      } else {
-        throw new Error(resp.detail || "Error al confirmar");
+      if (!AppState.depositoSeleccionadoId && AppState.diagnosticoActual?.estado_diagnostico === "SIN_COINCIDENCIA") {
+        showToast("No hay depósito coincidente. Usa 'Dejar En Espera' o 'Forzar SÍ Manual'", "warning");
+        return;
       }
-    } catch (err) {
-      showToast("Error confirmando voucher: " + err.message, "error");
-    }
-  });
 
-  // 2. Dejar En Espera (Rojo)
-  document.getElementById("btn-dejar-espera").addEventListener("click", async () => {
-    const datos = obtenerDatosFormulario();
-    if (!datos) return;
+      try {
+        const payload = {
+          ...datos,
+          id: AppState.voucherPendienteEditandoId,
+          deposito_asociado_id: AppState.depositoSeleccionadoId,
+          modo: AppState.modoOperacion,
+          imagen_path: AppState.archivoGuardadoPath
+        };
 
-    try {
-      const payload = {
-        ...datos,
-        id: AppState.voucherPendienteEditandoId,
-        imagen_path: AppState.archivoGuardadoPath
-      };
+        const res = await apiFetch(`${API_BASE}/api/vouchers/confirmar`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
 
-      const res = await apiFetch(`${API_BASE}/api/vouchers/en-espera`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const resp = await res.json();
-      if (resp.success) {
-        showToast("🔴 Voucher guardado EN ESPERA y registrado en Sheets", "warning");
-        resetearFormularioVoucher();
-        cargarEstadisticas();
-        cargarPendientes();
+        const resp = await parsearJsonSeguro(res, "Error al confirmar");
+        if (resp.success) {
+          showToast("🟢 Voucher CONCILIADO exitosamente y marcado en Google Sheets", "success");
+          resetearFormularioVoucher();
+          cargarEstadisticas();
+          cargarPendientes();
+        } else {
+          throw new Error(resp.detail || "Error al confirmar");
+        }
+      } catch (err) {
+        showToast("Error confirmando voucher: " + err.message, "error");
       }
-    } catch (err) {
-      showToast("Error guardando en espera: " + err.message, "error");
-    }
-  });
+    })
+  );
 
-  // 3. Forzar SÍ Manual (Emergencia)
-  document.getElementById("btn-forzar-si").addEventListener("click", async () => {
-    if (!confirm("⚠️ ¿Deseas autorizar manualmente este voucher sin depósito exacto en extracto? Se registrará como FORZADO MANUAL.")) {
-      return;
-    }
+  const btnEspera = document.getElementById("btn-dejar-espera");
+  btnEspera.addEventListener("click", () =>
+    conBotonOcupado(btnEspera, async () => {
+      const datos = obtenerDatosFormulario();
+      if (!datos) return;
 
-    const datos = obtenerDatosFormulario();
-    if (!datos) return;
+      try {
+        const payload = {
+          ...datos,
+          id: AppState.voucherPendienteEditandoId,
+          imagen_path: AppState.archivoGuardadoPath
+        };
 
-    try {
-      const payload = {
-        ...datos,
-        id: AppState.voucherPendienteEditandoId,
-        deposito_asociado_id: null,
-        modo: "FORZADO",
-        imagen_path: AppState.archivoGuardadoPath
-      };
+        const res = await apiFetch(`${API_BASE}/api/vouchers/en-espera`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
 
-      const res = await apiFetch(`${API_BASE}/api/vouchers/forzar-si`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const resp = await res.json();
-      if (resp.success) {
-        showToast("🔓 Voucher FORZADO MANUALMENTE y marcado en Google Sheets", "success");
-        resetearFormularioVoucher();
-        cargarEstadisticas();
-        cargarPendientes();
+        const resp = await parsearJsonSeguro(res, "Error guardando en espera");
+        if (resp.success) {
+          showToast("🔴 Voucher guardado EN ESPERA y registrado en Sheets", "warning");
+          resetearFormularioVoucher();
+          cargarEstadisticas();
+          cargarPendientes();
+        } else {
+          throw new Error(resp.detail || "Error guardando en espera");
+        }
+      } catch (err) {
+        showToast("Error guardando en espera: " + err.message, "error");
       }
-    } catch (err) {
-      showToast("Error al forzar SÍ: " + err.message, "error");
-    }
-  });
+    })
+  );
 
-  // Carga de Extractos (Vía B / archivo)
-  document.getElementById("btn-upload-extracto").addEventListener("click", uploadExtractoManual);
+  const btnForzar = document.getElementById("btn-forzar-si");
+  btnForzar.addEventListener("click", () =>
+    conBotonOcupado(btnForzar, async () => {
+      if (!confirm("⚠️ ¿Deseas autorizar manualmente este voucher sin depósito exacto en extracto? Se registrará como FORZADO MANUAL.")) {
+        return;
+      }
+
+      const datos = obtenerDatosFormulario();
+      if (!datos) return;
+
+      try {
+        const payload = {
+          ...datos,
+          id: AppState.voucherPendienteEditandoId,
+          deposito_asociado_id: null,
+          modo: "FORZADO",
+          imagen_path: AppState.archivoGuardadoPath
+        };
+
+        const res = await apiFetch(`${API_BASE}/api/vouchers/forzar-si`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const resp = await parsearJsonSeguro(res, "Error al forzar SÍ");
+        if (resp.success) {
+          showToast("🔓 Voucher FORZADO MANUALMENTE y marcado en Google Sheets", "success");
+          resetearFormularioVoucher();
+          cargarEstadisticas();
+          cargarPendientes();
+        } else {
+          throw new Error(resp.detail || "Error al forzar SÍ");
+        }
+      } catch (err) {
+        showToast("Error al forzar SÍ: " + err.message, "error");
+      }
+    })
+  );
+
+  const btnUploadExtracto = document.getElementById("btn-upload-extracto");
+  btnUploadExtracto.addEventListener("click", () => conBotonOcupado(btnUploadExtracto, uploadExtractoManual));
+
+  const btnRecruzarTodos = document.getElementById("btn-recruzar-todos");
+  btnRecruzarTodos.addEventListener("click", () => conBotonOcupado(btnRecruzarTodos, recruzarTodosPendientes));
+
   document.getElementById("btn-refresh-pendientes").addEventListener("click", cargarPendientes);
-  document.getElementById("btn-recruzar-todos").addEventListener("click", recruzarTodosPendientes);
   document.getElementById("btn-refresh-historial").addEventListener("click", () => {
     cargarEstadisticas();
     cargarHistorial();
@@ -714,10 +989,20 @@ function obtenerDatosFormulario() {
 function resetearFormularioVoucher() {
   document.getElementById("resultado-voucher").classList.add("hidden");
   document.getElementById("voucher-file-input").value = "";
+  limpiarPreviewLocal();
   AppState.voucherActual = null;
   AppState.diagnosticoActual = null;
   AppState.depositoSeleccionadoId = null;
+  AppState.archivoGuardadoPath = "";
   AppState.voucherPendienteEditandoId = null;
+
+  if (AppState.colaVouchers.length > 0) {
+    procesarSiguienteEnCola();
+  } else {
+    AppState.grupoSeleccionado = null;
+    renderGrupos();
+    actualizarBannerCola();
+  }
 }
 
 // ========================================================
@@ -726,10 +1011,10 @@ function resetearFormularioVoucher() {
 async function cargarPendientes() {
   const container = document.getElementById("lista-pendientes");
   const badgeCount = document.getElementById("badge-pendientes-count");
-  
+
   try {
     const res = await apiFetch(`${API_BASE}/api/vouchers/pendientes`);
-    const pendientes = await res.json();
+    const pendientes = await parsearJsonSeguro(res, "Error cargando pendientes");
 
     if (pendientes.length > 0) {
       badgeCount.textContent = pendientes.length;
@@ -751,44 +1036,82 @@ async function cargarPendientes() {
     pendientes.forEach((item) => {
       const card = document.createElement("div");
       card.className = "bg-slate-900 border border-slate-800 hover:border-slate-700 rounded-2xl p-3.5 space-y-2 shadow-sm";
+      const tieneFoto = Boolean(item.imagen_path);
+
       card.innerHTML = `
-        <div class="flex items-center justify-between">
-          <span class="text-xs font-bold text-white flex items-center gap-1.5">
-            <span class="w-2 h-2 rounded-full bg-rose-500"></span>
-            Voucher #${item.id} - ${item.grupo_whatsapp_nombre}
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-bold text-white flex items-center gap-1.5 min-w-0">
+            <span class="w-2 h-2 rounded-full bg-rose-500 shrink-0"></span>
+            <span class="truncate">Voucher #${escapeHtml(item.id)} - ${escapeHtml(item.grupo_whatsapp_nombre)}</span>
           </span>
-          <span class="font-mono text-sm font-extrabold text-rose-400">R$ ${item.monto.toFixed(2)}</span>
+          <span class="font-mono text-sm font-extrabold text-rose-400 shrink-0">R$ ${Number(item.monto).toFixed(2)}</span>
         </div>
         <div class="text-[11px] text-slate-400 space-y-0.5">
-          <p><strong>Fecha Comprobante:</strong> ${item.fecha_comprobante} ${item.hora_comprobante || ''}</p>
-          <p><strong>Pagador:</strong> ${item.pagador_nombre || 'No identificado'}</p>
-          <p class="truncate font-mono text-[10px] text-slate-500">ID PIX: ${item.id_transaccion_pix || 'S/N'}</p>
+          <p><strong>Fecha Comprobante:</strong> ${escapeHtml(item.fecha_comprobante)} ${escapeHtml(item.hora_comprobante || "")}</p>
+          <p><strong>Pagador:</strong> ${escapeHtml(item.pagador_nombre || "No identificado")}</p>
+          <p class="truncate font-mono text-[10px] text-slate-500">ID PIX: ${escapeHtml(item.id_transaccion_pix || "S/N")}</p>
         </div>
-        <div class="grid grid-cols-2 gap-2 pt-1 border-t border-slate-800/80">
-          <button class="btn-recruzar-pendiente py-1.5 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 rounded-lg text-xs font-semibold" data-id="${item.id}">
+        <div class="flex flex-wrap gap-2 pt-1 border-t border-slate-800/80">
+          <button type="button" class="btn-recruzar-pendiente flex-1 min-w-[110px] py-1.5 px-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 rounded-lg text-xs font-semibold">
             ⚡ Reintentar Cruce
           </button>
-          <button class="btn-forzar-pendiente py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded-lg text-xs font-semibold" data-id="${item.id}">
+          <button type="button" class="btn-forzar-pendiente flex-1 min-w-[90px] py-1.5 px-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 rounded-lg text-xs font-semibold">
             🔓 Forzar SÍ
+          </button>
+          ${tieneFoto ? `<button type="button" class="btn-foto-pendiente py-1.5 px-2.5 bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 rounded-lg text-xs font-semibold">👁️ Foto</button>` : ""}
+          <button type="button" class="btn-anular-pendiente py-1.5 px-2.5 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 rounded-lg text-xs font-semibold">
+            🗑️ Anular
           </button>
         </div>
       `;
 
       card.querySelector(".btn-recruzar-pendiente").addEventListener("click", () => retomarVoucherPendiente(item));
-      card.querySelector(".btn-forzar-pendiente").addEventListener("click", () => forzarVoucherDirecto(item));
+      const btnForzarPend = card.querySelector(".btn-forzar-pendiente");
+      btnForzarPend.addEventListener("click", () => conBotonOcupado(btnForzarPend, () => forzarVoucherDirecto(item)));
+      if (tieneFoto) {
+        card.querySelector(".btn-foto-pendiente").addEventListener("click", () => verFotoVoucher(item.imagen_path, `#${item.id}`));
+      }
+      const btnAnularPend = card.querySelector(".btn-anular-pendiente");
+      btnAnularPend.addEventListener("click", () => conBotonOcupado(btnAnularPend, () => anularVoucherPorId(item)));
 
       container.appendChild(card);
     });
   } catch (err) {
     console.error("Error cargando pendientes:", err);
+    showToast("Error cargando pendientes: " + err.message, "error");
+  }
+}
+
+async function anularVoucherPorId(v) {
+  if (!confirm(`¿Seguro que deseas ANULAR el voucher #${v.id} (R$ ${Number(v.monto).toFixed(2)})? Si tenía depósito asociado, quedará libre nuevamente.`)) {
+    return;
+  }
+  try {
+    const res = await apiFetch(`${API_BASE}/api/vouchers/${v.id}/anular`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ motivo: "Corrección manual" })
+    });
+    const data = await parsearJsonSeguro(res, "No se pudo anular el voucher");
+
+    showToast(
+      data.deposito_liberado
+        ? `⚪ Voucher #${v.id} anulado y depósito liberado`
+        : `⚪ Voucher #${v.id} anulado`,
+      "warning"
+    );
+    cargarPendientes();
+    cargarHistorial();
+    cargarEstadisticas();
+    cargarDepositosLibres();
+  } catch (err) {
+    showToast("Error anulando voucher: " + err.message, "error");
   }
 }
 
 function retomarVoucherPendiente(item) {
-  // Cambiar a pestaña 1
   document.querySelector('.nav-tab[data-target="tab-escanear"]').click();
 
-  // Seleccionar grupo
   const grp = AppState.grupos.find((g) => g.id === item.grupo_whatsapp_id);
   if (grp) {
     AppState.grupoSeleccionado = grp;
@@ -796,6 +1119,9 @@ function retomarVoucherPendiente(item) {
   }
 
   AppState.voucherPendienteEditandoId = item.id;
+  AppState.archivoGuardadoPath = item.imagen_path || "";
+  limpiarPreviewLocal();
+
   llenarFormularioHumanInTheLoop({
     monto: item.monto,
     fecha: item.fecha_comprobante,
@@ -805,6 +1131,22 @@ function retomarVoucherPendiente(item) {
     receptor_nombre: item.receptor_nombre,
     banco_destino: item.banco_destino
   });
+
+  if (item.imagen_path && !String(item.imagen_path).toLowerCase().endsWith(".pdf")) {
+    apiFetch(`${API_BASE}/api/vouchers/imagen?path=${encodeURIComponent(item.imagen_path)}`)
+      .then((res) => (res.ok ? res.blob() : null))
+      .then((blob) => {
+        if (!blob || !blob.type.startsWith("image/")) return;
+        const previewBox = document.getElementById("voucher-preview-box");
+        const previewImg = document.getElementById("voucher-preview-img");
+        AppState.previewObjectUrl = URL.createObjectURL(blob);
+        if (previewImg && previewBox) {
+          previewImg.src = AppState.previewObjectUrl;
+          previewBox.classList.remove("hidden");
+        }
+      })
+      .catch(() => {});
+  }
 
   document.getElementById("resultado-voucher").classList.remove("hidden");
   reanalizarManual();
@@ -822,10 +1164,11 @@ async function forzarVoucherDirecto(item) {
         fecha_comprobante: item.fecha_comprobante,
         grupo_whatsapp_id: item.grupo_whatsapp_id,
         grupo_whatsapp_nombre: item.grupo_whatsapp_nombre,
+        imagen_path: item.imagen_path || "",
         modo: "FORZADO"
       })
     });
-    const data = await res.json();
+    const data = await parsearJsonSeguro(res, "Error forzando voucher");
     if (data.success) {
       showToast("Voucher aprobado manualmente", "success");
       cargarPendientes();
@@ -841,8 +1184,7 @@ async function recruzarTodosPendientes() {
     const res = await apiFetch(`${API_BASE}/api/vouchers/recruzar-pendientes`, {
       method: "POST"
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Error al re-cruzar pendientes");
+    const data = await parsearJsonSeguro(res, "Error al re-cruzar pendientes");
 
     if (data.resueltos_count > 0) {
       showToast(`⚡ Se conciliaron ${data.resueltos_count} voucher(s) automáticamente (${data.pendientes_restantes} restante(s))`, "success");
@@ -857,8 +1199,14 @@ async function recruzarTodosPendientes() {
 }
 
 // ========================================================
-// EXTRACTOS BANCARIOS (VÍA B Y EXTENSIÓN)
+// EXTRACTOS BANCARIOS Y FILTRO EN VIVO
 // ========================================================
+function initFiltrosEnVivo() {
+  document.getElementById("libres-buscar")?.addEventListener("input", renderDepositosLibres);
+  document.getElementById("historial-buscar")?.addEventListener("input", renderHistorial);
+  document.getElementById("historial-filtro-estado")?.addEventListener("change", renderHistorial);
+}
+
 async function uploadExtractoManual() {
   const fileInput = document.getElementById("extracto-file-input");
   const bancoSelect = document.getElementById("extracto-banco-select");
@@ -880,10 +1228,7 @@ async function uploadExtractoManual() {
       body: formData
     });
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.detail || "Error en el servidor al procesar extracto");
-    }
+    const data = await parsearJsonSeguro(res, "Error en el servidor al procesar extracto");
 
     if (data.success) {
       showToast(`✅ Se agregaron ${data.insertados} depósitos libres al bolsón`, "success");
@@ -901,51 +1246,71 @@ async function uploadExtractoManual() {
 }
 
 async function cargarDepositosLibres() {
+  try {
+    const res = await apiFetch(`${API_BASE}/api/extractos/libres`);
+    AppState.libresLista = await parsearJsonSeguro(res, "Error cargando depósitos libres");
+    renderDepositosLibres();
+  } catch (err) {
+    console.error("Error cargando depósitos libres:", err);
+    showToast("Error cargando depósitos libres: " + err.message, "error");
+  }
+}
+
+function renderDepositosLibres() {
   const container = document.getElementById("lista-depositos-libres");
   const countEl = document.getElementById("count-dep-libres");
   const sumaEl = document.getElementById("suma-dep-libres");
+  const query = (document.getElementById("libres-buscar")?.value || "").trim().toLowerCase();
 
-  try {
-    const res = await apiFetch(`${API_BASE}/api/extractos/libres`);
-    const depositos = await res.json();
+  const filtrados = AppState.libresLista.filter((dep) => {
+    if (!query) return true;
+    const texto = [
+      dep.banco,
+      dep.descripcion,
+      dep.fecha,
+      dep.hora,
+      dep.origen_extracto,
+      dep.id_transaccion_pix,
+      String(dep.monto),
+      Number(dep.monto).toFixed(2)
+    ].join(" ").toLowerCase();
+    return texto.includes(query);
+  });
 
-    countEl.textContent = depositos.length;
-    const totalSuma = depositos.reduce((acc, d) => acc + d.monto, 0);
-    sumaEl.textContent = `R$ ${totalSuma.toLocaleString("es-BO", { minimumFractionDigits: 2 })}`;
+  countEl.textContent = filtrados.length;
+  const totalSuma = filtrados.reduce((acc, d) => acc + Number(d.monto || 0), 0);
+  sumaEl.textContent = `R$ ${totalSuma.toLocaleString("es-BO", { minimumFractionDigits: 2 })}`;
 
-    container.innerHTML = "";
-    if (depositos.length === 0) {
-      container.innerHTML = `
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center text-slate-400 text-xs">
-          No hay depósitos libres en este momento. Carga un extracto o usa la Extensión de Chrome.
-        </div>
-      `;
-      return;
-    }
-
-    depositos.slice(0, 50).forEach((dep) => {
-      const card = document.createElement("div");
-      card.className = "bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between";
-      card.innerHTML = `
-        <div class="text-xs space-y-0.5">
-          <p class="font-bold text-white flex items-center gap-1.5">
-            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-            ${dep.banco}
-            <span class="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.2 rounded font-normal">${dep.origen_extracto}</span>
-          </p>
-          <p class="text-slate-400 text-[11px] truncate max-w-[240px]">${dep.descripcion}</p>
-          <p class="text-[10px] text-slate-500 font-mono">${dep.fecha} ${dep.hora || ''}</p>
-        </div>
-        <div class="text-right">
-          <span class="font-mono text-sm font-extrabold text-emerald-400">R$ ${dep.monto.toFixed(2)}</span>
-          <p class="text-[10px] text-emerald-500/80 font-semibold">LIBRE</p>
-        </div>
-      `;
-      container.appendChild(card);
-    });
-  } catch (err) {
-    console.error("Error cargando depósitos libres:", err);
+  container.innerHTML = "";
+  if (filtrados.length === 0) {
+    container.innerHTML = `
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center text-slate-400 text-xs">
+        ${query ? "Sin depósitos que coincidan con tu búsqueda." : "No hay depósitos libres en este momento. Carga un extracto o usa la Extensión de Chrome."}
+      </div>
+    `;
+    return;
   }
+
+  filtrados.slice(0, 50).forEach((dep) => {
+    const card = document.createElement("div");
+    card.className = "bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between";
+    card.innerHTML = `
+      <div class="text-xs space-y-0.5">
+        <p class="font-bold text-white flex items-center gap-1.5">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+          ${escapeHtml(dep.banco)}
+          <span class="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.2 rounded font-normal">${escapeHtml(dep.origen_extracto)}</span>
+        </p>
+        <p class="text-slate-400 text-[11px] truncate max-w-[240px]">${escapeHtml(dep.descripcion)}</p>
+        <p class="text-[10px] text-slate-500 font-mono">${escapeHtml(dep.fecha)} ${escapeHtml(dep.hora || "")}</p>
+      </div>
+      <div class="text-right">
+        <span class="font-mono text-sm font-extrabold text-emerald-400">R$ ${Number(dep.monto).toFixed(2)}</span>
+        <p class="text-[10px] text-emerald-500/80 font-semibold">LIBRE</p>
+      </div>
+    `;
+    container.appendChild(card);
+  });
 }
 
 // ========================================================
@@ -954,7 +1319,7 @@ async function cargarDepositosLibres() {
 async function cargarEstadisticas() {
   try {
     const res = await apiFetch(`${API_BASE}/api/stats`);
-    const s = await res.json();
+    const s = await parsearJsonSeguro(res, "Error cargando estadísticas");
     document.getElementById("stat-monto-conciliado").textContent = `R$ ${s.conciliados_monto.toLocaleString("es-BO", { minimumFractionDigits: 2 })}`;
     document.getElementById("stat-count-conciliado").textContent = s.conciliados_count;
     document.getElementById("stat-monto-espera").textContent = `R$ ${s.espera_monto.toLocaleString("es-BO", { minimumFractionDigits: 2 })}`;
@@ -965,89 +1330,94 @@ async function cargarEstadisticas() {
 }
 
 async function cargarHistorial() {
-  const container = document.getElementById("lista-historial");
   try {
-    const res = await apiFetch(`${API_BASE}/api/vouchers/historial?limite=80`);
-    const lista = await res.json();
-
-    container.innerHTML = "";
-    if (lista.length === 0) {
-      container.innerHTML = `
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center text-slate-400 text-xs">
-          Aún no hay vouchers registrados en el historial de hoy.
-        </div>
-      `;
-      return;
-    }
-
-    lista.forEach((v) => {
-      const card = document.createElement("div");
-      let estadoBadge = `<span class="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🟢 SÍ</span>`;
-      if (v.estado === "FORZADO_MANUAL") {
-        estadoBadge = `<span class="bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🔓 SÍ (MANUAL)</span>`;
-      } else if (v.estado === "EN_ESPERA") {
-        estadoBadge = `<span class="bg-rose-500/20 text-rose-400 border border-rose-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🔴 ESPERA</span>`;
-      } else if (v.estado === "ANULADO") {
-        estadoBadge = `<span class="bg-slate-700/50 text-slate-300 border border-slate-600/50 px-2 py-0.5 rounded text-[10px] font-bold">⚪ ANULADO</span>`;
-      }
-
-      const puedeAnular = v.estado === "CONCILIADO" || v.estado === "FORZADO_MANUAL";
-
-      card.className = "bg-slate-900 border border-slate-800 rounded-xl p-3 space-y-1.5 shadow-sm";
-      card.innerHTML = `
-        <div class="flex items-center justify-between gap-2">
-          <div class="flex items-center space-x-2 min-w-0">
-            ${estadoBadge}
-            <span class="text-xs font-bold text-white truncate">#${v.id} - ${v.grupo_whatsapp_nombre}</span>
-          </div>
-          <div class="flex items-center gap-2 shrink-0">
-            <span class="font-mono text-sm font-extrabold text-white">R$ ${v.monto.toFixed(2)}</span>
-            ${puedeAnular ? `<button type="button" class="btn-anular-voucher px-2 py-0.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-[10px] font-semibold transition">🗑️ Anular</button>` : ""}
-          </div>
-        </div>
-        <div class="text-[11px] text-slate-400 flex justify-between">
-          <span>De: ${v.pagador_nombre || 'N/A'}</span>
-          <span>${v.fecha_comprobante}</span>
-        </div>
-        <div class="text-[10px] text-slate-500 font-mono truncate">
-          ${v.id_transaccion_pix ? `PIX: ${v.id_transaccion_pix}` : `Banco: ${v.banco_destino || 'N/A'}`}
-        </div>
-      `;
-
-      if (puedeAnular) {
-        card.querySelector(".btn-anular-voucher").addEventListener("click", async () => {
-          if (!confirm(`¿Seguro que deseas ANULAR el voucher #${v.id} (R$ ${v.monto.toFixed(2)})? Si tenía depósito asociado, quedará libre nuevamente.`)) {
-            return;
-          }
-          try {
-            const res = await apiFetch(`${API_BASE}/api/vouchers/${v.id}/anular`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ motivo: "Corrección manual desde historial" })
-            });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || "No se pudo anular el voucher");
-
-            showToast(
-              data.deposito_liberado
-                ? `⚪ Voucher #${v.id} anulado y depósito liberado`
-                : `⚪ Voucher #${v.id} anulado`,
-              "warning"
-            );
-            cargarHistorial();
-            cargarEstadisticas();
-            cargarDepositosLibres();
-          } catch (err) {
-            showToast("Error anulando voucher: " + err.message, "error");
-          }
-        });
-      }
-
-      container.appendChild(card);
-    });
+    const res = await apiFetch(`${API_BASE}/api/vouchers/historial?limite=120`);
+    AppState.historialLista = await parsearJsonSeguro(res, "Error cargando historial");
+    renderHistorial();
   } catch (err) {
     console.error("Error cargando historial:", err);
+    showToast("Error cargando historial: " + err.message, "error");
   }
+}
+
+function renderHistorial() {
+  const container = document.getElementById("lista-historial");
+  const query = (document.getElementById("historial-buscar")?.value || "").trim().toLowerCase();
+  const filtroEstado = document.getElementById("historial-filtro-estado")?.value || "TODOS";
+
+  const filtrados = AppState.historialLista.filter((v) => {
+    if (filtroEstado !== "TODOS" && v.estado !== filtroEstado) return false;
+    if (!query) return true;
+    const texto = [
+      `#${v.id}`,
+      v.grupo_whatsapp_nombre,
+      v.pagador_nombre,
+      v.receptor_nombre,
+      String(v.monto),
+      Number(v.monto).toFixed(2),
+      v.id_transaccion_pix,
+      v.banco_destino,
+      v.fecha_comprobante
+    ].join(" ").toLowerCase();
+    return texto.includes(query);
+  });
+
+  container.innerHTML = "";
+  if (filtrados.length === 0) {
+    container.innerHTML = `
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center text-slate-400 text-xs">
+        ${AppState.historialLista.length === 0 ? "Aún no hay vouchers registrados en el historial." : "Sin resultados para los filtros seleccionados."}
+      </div>
+    `;
+    return;
+  }
+
+  filtrados.forEach((v) => {
+    const card = document.createElement("div");
+    let estadoBadge = `<span class="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🟢 SÍ</span>`;
+    if (v.estado === "FORZADO_MANUAL") {
+      estadoBadge = `<span class="bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🔓 SÍ (MANUAL)</span>`;
+    } else if (v.estado === "EN_ESPERA") {
+      estadoBadge = `<span class="bg-rose-500/20 text-rose-400 border border-rose-500/30 px-2 py-0.5 rounded text-[10px] font-bold">🔴 ESPERA</span>`;
+    } else if (v.estado === "ANULADO") {
+      estadoBadge = `<span class="bg-slate-700/50 text-slate-300 border border-slate-600/50 px-2 py-0.5 rounded text-[10px] font-bold">⚪ ANULADO</span>`;
+    }
+
+    const puedeAnular = v.estado === "CONCILIADO" || v.estado === "FORZADO_MANUAL" || v.estado === "EN_ESPERA";
+    const tieneFoto = Boolean(v.imagen_path);
+
+    card.className = "bg-slate-900 border border-slate-800 rounded-xl p-3 space-y-1.5 shadow-sm";
+    card.innerHTML = `
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex items-center space-x-2 min-w-0">
+          ${estadoBadge}
+          <span class="text-xs font-bold text-white truncate">#${escapeHtml(v.id)} - ${escapeHtml(v.grupo_whatsapp_nombre)}</span>
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <span class="font-mono text-sm font-extrabold text-white">R$ ${Number(v.monto).toFixed(2)}</span>
+          ${tieneFoto ? `<button type="button" class="btn-ver-foto px-2 py-0.5 rounded-lg bg-sky-500/10 hover:bg-sky-500/20 border border-sky-500/30 text-sky-300 text-[10px] font-semibold transition">👁️ Foto</button>` : ""}
+          ${puedeAnular ? `<button type="button" class="btn-anular-voucher px-2 py-0.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 text-[10px] font-semibold transition">🗑️ Anular</button>` : ""}
+        </div>
+      </div>
+      <div class="text-[11px] text-slate-400 flex justify-between">
+        <span>De: ${escapeHtml(v.pagador_nombre || "N/A")}</span>
+        <span>${escapeHtml(v.fecha_comprobante)}</span>
+      </div>
+      <div class="text-[10px] text-slate-500 font-mono truncate">
+        ${v.id_transaccion_pix ? `PIX: ${escapeHtml(v.id_transaccion_pix)}` : `Banco: ${escapeHtml(v.banco_destino || "N/A")}`}
+      </div>
+    `;
+
+    if (tieneFoto) {
+      card.querySelector(".btn-ver-foto").addEventListener("click", () => verFotoVoucher(v.imagen_path, `#${v.id}`));
+    }
+    if (puedeAnular) {
+      const btnAnular = card.querySelector(".btn-anular-voucher");
+      btnAnular.addEventListener("click", () => conBotonOcupado(btnAnular, () => anularVoucherPorId(v)));
+    }
+
+    container.appendChild(card);
+  });
 }
 
 // ========================================================
@@ -1074,8 +1444,26 @@ function initCierreCaja() {
     document.getElementById(id)?.addEventListener("input", recalcularCuadreCierre);
   });
 
+  const btnReintentarSheets = document.getElementById("btn-reintentar-sheets");
+  btnReintentarSheets?.addEventListener("click", () => conBotonOcupado(btnReintentarSheets, reintentarSheetsSync));
+
   document.getElementById("btn-copiar-whatsapp")?.addEventListener("click", copiarResumenWhatsApp);
-  document.getElementById("btn-confirmar-cierre")?.addEventListener("click", confirmarCierreCaja);
+
+  const btnConfirmarCierre = document.getElementById("btn-confirmar-cierre");
+  btnConfirmarCierre?.addEventListener("click", () => conBotonOcupado(btnConfirmarCierre, confirmarCierreCaja));
+}
+
+async function reintentarSheetsSync() {
+  try {
+    const res = await apiFetch(`${API_BASE}/api/sheets/reintentar`, { method: "POST" });
+    const data = await parsearJsonSeguro(res, "Error al reintentar sincronización con Sheets");
+    showToast(
+      `🔄 Sheets: ${data.sincronizados}/${data.intentados} sincronizado(s), ${data.pendientes} pendiente(s)`,
+      data.pendientes === 0 ? "success" : "warning"
+    );
+  } catch (err) {
+    showToast("Error reintentando Sheets: " + err.message, "error");
+  }
 }
 
 async function cargarCierreCaja(fechaParam) {
@@ -1085,13 +1473,11 @@ async function cargarCierreCaja(fechaParam) {
 
   try {
     const res = await apiFetch(`${API_BASE}/api/cierre-caja?fecha=${encodeURIComponent(fecha)}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Error cargando cierre de caja");
+    const data = await parsearJsonSeguro(res, "Error cargando cierre de caja");
 
     AppState.cierreActual = data;
     const tot = data.totales || {};
 
-    // Badge estado
     const badge = document.getElementById("cierre-estado-badge");
     if (data.estado_caja === "CERRADO") {
       badge.textContent = "🔒 CERRADO";
@@ -1101,7 +1487,6 @@ async function cargarCierreCaja(fechaParam) {
       badge.className = "inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30";
     }
 
-    // KPIs
     document.getElementById("cierre-total-aprobado").textContent = formatearBRL(tot.aprobado_monto);
     document.getElementById("cierre-count-aprobado").textContent = `${tot.aprobado_count || 0} ops (${tot.conciliados_count || 0} auto, ${tot.forzados_count || 0} manual)`;
 
@@ -1114,7 +1499,6 @@ async function cargarCierreCaja(fechaParam) {
     document.getElementById("cierre-total-libres").textContent = formatearBRL(tot.depositos_libres_monto);
     document.getElementById("cierre-count-libres").textContent = `${tot.depositos_libres_count || 0} sin asignar`;
 
-    // Alertas
     const alertasBox = document.getElementById("cierre-alertas-box");
     const alertas = data.alertas || {};
     const espera = alertas.vouchers_espera || [];
@@ -1139,7 +1523,6 @@ async function cargarCierreCaja(fechaParam) {
       alertasBox.innerHTML = `<p class="font-bold text-amber-300 uppercase tracking-wider text-[11px]">⚠️ Alertas del Día</p>${items.join("")}`;
     }
 
-    // Por Grupo
     const porGrupoEl = document.getElementById("cierre-por-grupo");
     const grupos = data.por_grupo || [];
     if (grupos.length === 0) {
@@ -1148,7 +1531,7 @@ async function cargarCierreCaja(fechaParam) {
       porGrupoEl.innerHTML = grupos.map((g) => `
         <div class="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-xl px-3 py-2">
           <div>
-            <p class="font-semibold text-white">${g.grupo}</p>
+            <p class="font-semibold text-white">${escapeHtml(g.grupo)}</p>
             <p class="text-[10px] text-slate-400">${g.total_aprobado_count} aprobados${g.forzados_count ? ` (${g.forzados_count} manual)` : ""}${g.espera_count ? ` · ${g.espera_count} en espera` : ""}</p>
           </div>
           <span class="font-mono font-bold text-emerald-400">${formatearBRL(g.total_aprobado_monto)}</span>
@@ -1156,7 +1539,6 @@ async function cargarCierreCaja(fechaParam) {
       `).join("");
     }
 
-    // Por Banco
     const porBancoEl = document.getElementById("cierre-por-banco");
     const bancos = data.por_banco || [];
     if (bancos.length === 0) {
@@ -1165,7 +1547,7 @@ async function cargarCierreCaja(fechaParam) {
       porBancoEl.innerHTML = bancos.map((b) => `
         <div class="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-xl px-3 py-2">
           <div>
-            <p class="font-semibold text-white">${b.banco}</p>
+            <p class="font-semibold text-white">${escapeHtml(b.banco)}</p>
             <p class="text-[10px] text-slate-400">${b.entradas_count} entradas · ${b.usados_count} usados / ${b.libres_count} libres</p>
           </div>
           <span class="font-mono font-bold text-sky-400">${formatearBRL(b.entradas_monto)}</span>
@@ -1173,7 +1555,6 @@ async function cargarCierreCaja(fechaParam) {
       `).join("");
     }
 
-    // Precargar saldos si ya existía cierre guardado
     const cg = data.cierre_guardado;
     document.getElementById("cierre-saldo-inicial").value = cg ? cg.saldo_inicial_brl : 0;
     document.getElementById("cierre-salidas").value = cg ? cg.salidas_brl : 0;
@@ -1245,6 +1626,12 @@ async function copiarResumenWhatsApp() {
 
 async function confirmarCierreCaja() {
   const fecha = document.getElementById("cierre-fecha")?.value || new Date().toISOString().split("T")[0];
+  if (AppState.cierreActual?.estado_caja === "CERRADO") {
+    if (!confirm(`El cierre del día ${fecha} ya estaba CERRADO. ¿Deseas volver a guardarlo y sobrescribirlo?`)) {
+      return;
+    }
+  }
+
   const saldoInicial = parseFloat(document.getElementById("cierre-saldo-inicial")?.value) || 0;
   const salidas = parseFloat(document.getElementById("cierre-salidas")?.value) || 0;
   const saldoRealRaw = document.getElementById("cierre-saldo-real")?.value;
@@ -1263,8 +1650,7 @@ async function confirmarCierreCaja() {
         observaciones
       })
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Error al guardar el cierre");
+    await parsearJsonSeguro(res, "Error al guardar el cierre");
 
     showToast(`🔒 Cierre de caja ${fecha} guardado correctamente`, "success");
     await cargarCierreCaja(fecha);
